@@ -1,0 +1,20 @@
+[Unit]
+Description=Gemini Balance (FastAPI/Uvicorn) - Gemini API load balancer
+After=network-online.target mysql.service
+Wants=network-online.target
+Requires=mysql.service
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+WorkingDirectory=/path/to/gemini-balance
+ExecStart=/path/to/gemini-balance/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gemini-balance
+
+[Install]
+WantedBy=multi-user.target

@@ -231,6 +231,27 @@ def _filter_empty_parts(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return filtered_contents
 
 
+def _ensure_valid_ending_turn(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure contents do not end with a model turn / empty parts.
+
+    Gemini rejects requests whose last content has role "model" (400
+    "Requests ending with a model turn are not supported"). The upstream
+    @ai-sdk/google SDK may emit a trailing empty model turn, and this
+    proxy's _filter_empty_parts can additionally drop a trailing empty
+    user turn, exposing a model turn. Append a minimal user turn to make
+    the payload valid.
+    """
+    if not contents:
+        contents = []
+    last = contents[-1] if contents else None
+    last_role = (last or {}).get("role")
+    last_parts = (last or {}).get("parts")
+    if last is None or last_role == "model" or not last_parts:
+        contents = list(contents)
+        contents.append({"role": "user", "parts": [{"text": "continue"}]})
+    return contents
+
+
 def _build_payload(model: str, request: GeminiRequest) -> Dict[str, Any]:
     """构建请求payload"""
     request_dict = request.model_dump(exclude_none=False)
@@ -246,7 +267,9 @@ def _build_payload(model: str, request: GeminiRequest) -> Dict[str, Any]:
     if is_tts_model:
         # TTS模型使用简化的payload，不包含tools和safetySettings
         payload = {
-            "contents": _filter_empty_parts(request_dict.get("contents", [])),
+            "contents": _ensure_valid_ending_turn(
+                _filter_empty_parts(request_dict.get("contents", []))
+            ),
             "generationConfig": request_dict.get("generationConfig"),
         }
 
@@ -256,7 +279,9 @@ def _build_payload(model: str, request: GeminiRequest) -> Dict[str, Any]:
     else:
         # 非TTS模型使用完整的payload
         payload = {
-            "contents": _filter_empty_parts(request_dict.get("contents", [])),
+            "contents": _ensure_valid_ending_turn(
+                _filter_empty_parts(request_dict.get("contents", []))
+            ),
             "tools": _build_tools(model, request_dict),
             "safetySettings": _get_safety_settings(model),
             "generationConfig": request_dict.get("generationConfig"),

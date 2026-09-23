@@ -259,3 +259,8 @@ $RECYCLE.BIN/
 
 tests/
 default_db
+
+# Local / internal-only docs (not for public repo)
+AGENTS.md
+AIGUIDE.md
+DIAGNOSIS-*.md
