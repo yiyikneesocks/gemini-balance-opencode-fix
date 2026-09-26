@@ -8,6 +8,7 @@ import httpx
 
 from app.config.config import settings
 from app.core.constants import DEFAULT_TIMEOUT
+from app.exception.exceptions import UpstreamNetworkError
 from app.log.logger import get_api_client_logger
 
 logger = get_api_client_logger()
@@ -99,7 +100,10 @@ class GeminiApiClient(ApiClient):
 
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/models/{model}:generateContent?key={api_key}"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
 
             if response.status_code != 200:
                 error_content = response.text
@@ -132,15 +136,19 @@ class GeminiApiClient(ApiClient):
         headers = self._prepare_headers()
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
-            async with client.stream(
-                method="POST", url=url, json=payload, headers=headers
-            ) as response:
-                if response.status_code != 200:
-                    error_content = await response.aread()
-                    error_msg = error_content.decode("utf-8")
-                    raise Exception(response.status_code, error_msg)
-                async for line in response.aiter_lines():
-                    yield line
+            try:
+                stream_ctx = client.stream(
+                    method="POST", url=url, json=payload, headers=headers
+                )
+                async with stream_ctx as response:
+                    if response.status_code != 200:
+                        error_content = await response.aread()
+                        error_msg = error_content.decode("utf-8")
+                        raise Exception(response.status_code, error_msg)
+                    async for line in response.aiter_lines():
+                        yield line
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
 
     async def count_tokens(
         self, payload: Dict[str, Any], model: str, api_key: str
@@ -159,7 +167,10 @@ class GeminiApiClient(ApiClient):
         headers = self._prepare_headers()
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/models/{model}:countTokens?key={api_key}"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 raise Exception(response.status_code, error_content)
@@ -183,7 +194,10 @@ class GeminiApiClient(ApiClient):
         headers = self._prepare_headers()
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/models/{model}:embedContent?key={api_key}"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 logger.error(
@@ -210,7 +224,10 @@ class GeminiApiClient(ApiClient):
         headers = self._prepare_headers()
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/models/{model}:batchEmbedContents?key={api_key}"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 logger.error(
@@ -248,7 +265,10 @@ class OpenaiApiClient(ApiClient):
         headers = self._prepare_headers(api_key)
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/openai/models"
-            response = await client.get(url, headers=headers)
+            try:
+                response = await client.get(url, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 raise Exception(response.status_code, error_content)
@@ -272,7 +292,10 @@ class OpenaiApiClient(ApiClient):
         headers = self._prepare_headers(api_key)
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/openai/chat/completions"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 raise Exception(response.status_code, error_content)
@@ -293,15 +316,19 @@ class OpenaiApiClient(ApiClient):
         headers = self._prepare_headers(api_key)
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/openai/chat/completions"
-            async with client.stream(
-                method="POST", url=url, json=payload, headers=headers
-            ) as response:
-                if response.status_code != 200:
-                    error_content = await response.aread()
-                    error_msg = error_content.decode("utf-8")
-                    raise Exception(response.status_code, error_msg)
-                async for line in response.aiter_lines():
-                    yield line
+            try:
+                stream_ctx = client.stream(
+                    method="POST", url=url, json=payload, headers=headers
+                )
+                async with stream_ctx as response:
+                    if response.status_code != 200:
+                        error_content = await response.aread()
+                        error_msg = error_content.decode("utf-8")
+                        raise Exception(response.status_code, error_msg)
+                    async for line in response.aiter_lines():
+                        yield line
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
 
     async def create_embeddings(
         self, input: str, model: str, api_key: str
@@ -323,7 +350,10 @@ class OpenaiApiClient(ApiClient):
                 "input": input,
                 "model": model,
             }
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 raise Exception(response.status_code, error_content)
@@ -345,7 +375,10 @@ class OpenaiApiClient(ApiClient):
         headers = self._prepare_headers(api_key)
         async with httpx.AsyncClient(timeout=timeout, proxy=proxy_to_use) as client:
             url = f"{self.base_url}/openai/images/generations"
-            response = await client.post(url, json=payload, headers=headers)
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+            except httpx.HTTPError as e:
+                raise UpstreamNetworkError(f"{type(e).__name__}: {e}") from e
             if response.status_code != 200:
                 error_content = response.text
                 raise Exception(response.status_code, error_content)

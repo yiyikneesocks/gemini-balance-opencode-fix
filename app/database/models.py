@@ -70,6 +70,39 @@ class FileState(enum.Enum):
     FAILED = "FAILED"
 
 
+class KeyModelState(Base):
+    """
+    (key, model) 限流状态持久化表。
+
+    用于跨重启保留 429/503 冷却与今日出错记录，避免重启后监控统计归零、
+    也避免重启立刻重新打爆上游配额。key 按脱敏后的 SHA256 存储，不落明文。
+    """
+
+    __tablename__ = "t_key_model_state"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key_hash = Column(String(64), nullable=False, comment="API key 的 SHA256（不落明文）")
+    key_masked = Column(String(64), nullable=True, comment="脱敏后的 key，仅用于展示")
+    model_name = Column(String(100), nullable=False, comment="模型名称")
+    kind = Column(String(10), nullable=True, comment="最近错误类型：rpd/rpm")
+    cooldown_until = Column(DateTime, nullable=True, comment="冷却截止时间（本地时间）")
+    last_error_time = Column(DateTime, nullable=True, comment="最近一次出错时间")
+    consecutive_failures = Column(Integer, nullable=True, default=0, comment="连续失败次数")
+    error_code = Column(Integer, nullable=True, comment="最近错误状态码")
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+        comment="更新时间",
+    )
+
+    def __repr__(self):
+        return (
+            f"<KeyModelState(model='{self.model_name}', "
+            f"key='{self.key_masked}', kind='{self.kind}')>"
+        )
+
+
 class FileRecord(Base):
     """
     文件记录表，用于存储上传到 Gemini 的文件信息

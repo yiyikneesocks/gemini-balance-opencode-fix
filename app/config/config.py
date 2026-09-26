@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     TEST_MODEL: str = DEFAULT_MODEL
     TIME_OUT: int = DEFAULT_TIMEOUT
     MAX_RETRIES: int = MAX_RETRIES
+    # 网络错误重试（同 key 指数退避，不计入 key 失败数）
+    NETWORK_RETRY_ATTEMPTS: int = 3
+    NETWORK_BACKOFF_BASE_S: float = 1.0  # 1s, 2s, 4s...
+    # 按 key 冷却（429/503 指数退避轮换）
+    COOLDOWN_BASE_S: float = 2.0  # 首次 2s，之后 4s/8s/...加抖动
+    COOLDOWN_MAX_S: float = 64.0  # 单次冷却封顶
+    ALL_COOLING_MAX_WAIT_S: float = 10.0  # 全部 key 冷却时最多等最早到期的秒数
+    # 按天配额（RPD）耗尽的长冷却
+    RPD_COOLDOWN_HOURS: float = 24.0  # 日耗尽后的禁用时长（小时）
+    RPD_MIN_THRESHOLD_S: float = 300.0  # 剩余冷却超过此值视为"长冷却/RPD"（5 分钟）
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []

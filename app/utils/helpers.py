@@ -9,10 +9,12 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import requests
 
 from app.config.config import Settings
 from app.core.constants import DATA_URL_PATTERN, IMAGE_URL_PATTERN, VALID_IMAGE_RATIOS
+from app.exception.exceptions import APIError
 
 helper_logger = logging.getLogger("app.utils")
 
@@ -177,6 +179,38 @@ def redact_key_for_logging(key: str) -> str:
         return f"{key[:3]}...{key[-3:]}"
     else:
         return f"{key[:6]}...{key[-6:]}"
+
+
+def extract_error_info(e: Exception) -> Tuple[Any, str]:
+    """
+    安全地从异常中提取 (status_code, message)。
+
+    兼容三类异常，避免 "tuple index out of range"：
+    - httpx 网络异常（ConnectError/Timeout/...）：返回 503 + 明确的网络排查提示
+    - 本项目 API 客户端以 Exception(status, msg) 抛出的双参数异常
+    - 任意其它异常：返回 502 + 原始字符串
+
+    Args:
+        e: 捕获到的异常
+
+    Returns:
+        tuple: (status_code, message)
+    """
+    if isinstance(e, APIError):
+        return e.status_code, e.detail
+
+    if isinstance(e, httpx.HTTPError):
+        return (
+            503,
+            f"cannot reach upstream Gemini API ({type(e).__name__}: {e}). "
+            "Please check network connectivity",
+        )
+
+    if len(e.args) >= 2:
+        return e.args[0], e.args[1]
+    if len(e.args) == 1:
+        return 502, str(e.args[0])
+    return 502, str(e)
 
 
 def get_current_version(default_version: str = "0.0.0") -> str:

@@ -2,6 +2,9 @@ from contextlib import asynccontextmanager
 from fastapi import HTTPException
 import logging
 
+from app.exception.exceptions import APIError
+
+
 @asynccontextmanager
 async def handle_route_errors(logger: logging.Logger, operation_name: str, success_message: str = None, failure_message: str = None):
     """
@@ -24,6 +27,10 @@ async def handle_route_errors(logger: logging.Logger, operation_name: str, succe
         # 如果已经是 HTTPException，直接重新抛出，保留原始状态码和详情
         logger.error(f"{failure_message or default_failure_msg}: {http_exc.detail} (Status: {http_exc.status_code})")
         raise http_exc
+    except APIError as api_exc:
+        # 自定义 API 错误（含网络不可达）：保留状态码与明确详情，交给全局处理器
+        logger.error(f"{failure_message or default_failure_msg}: {api_exc.detail} (Status: {api_exc.status_code})")
+        raise api_exc
     except Exception as e:
         # 对于其他所有异常，记录错误并抛出标准的 500 错误
         logger.error(f"{failure_message or default_failure_msg}: {str(e)}")

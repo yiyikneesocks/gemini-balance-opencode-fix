@@ -81,3 +81,40 @@ async def get_all_keys(
         "invalid_keys": list(all_keys_with_status["invalid_keys"].keys()),
         "total_count": len(all_keys_with_status["valid_keys"]) + len(all_keys_with_status["invalid_keys"])
     }
+
+@router.get("/api/keys/model-cooldown")
+async def get_model_cooldown(
+    request: Request,
+    key_manager: KeyManager = Depends(get_key_manager_instance),
+):
+    """
+    按模型展示今日出现过 429/503 的 (key, model) 冷却状态。
+
+    只包含"今日已调用过且出错"的模型（冷却状态仅在出错时写入，天然满足）。
+    kind: "rpd" = 日配额耗尽（长冷却，重置前该 key 该模型不可用）；
+          "rpm" = 瞬时限流（短冷却，到期自动恢复）。
+    """
+    auth_token = request.cookies.get("auth_token")
+    if not auth_token or not verify_auth_token(auth_token):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    state = key_manager.get_model_cooling_state()
+    models = [
+        {
+            "model": model,
+            "status": v.get("status", "available"),
+            "status_label": v.get("status_label", ""),
+            "cooling_keys": v["cooling_keys"],
+            "rpd_keys": v["rpd_keys"],
+            "rpm_keys": v["rpm_keys"],
+            "error_keys": v.get("error_keys", 0),
+            "earliest_release_s": round(v["earliest_release_s"], 1),
+            "keys": v["keys"],
+        }
+        for model, v in sorted(state.items())
+    ]
+    return {
+        "models": models,
+        "total_models": len(models),
+        "all_exhausted_note": "rpd = daily quota exhausted; rpm = temporary rate limit",
+    }

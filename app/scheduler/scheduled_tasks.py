@@ -1,6 +1,7 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.config.config import settings
+from app.core.error_classifier import ErrorCategory, classify_and_extract
 from app.domain.gemini_models import GeminiContent, GeminiRequest
 from app.log.logger import Logger
 from app.service.chat.gemini_chat_service import GeminiChatService
@@ -71,6 +72,14 @@ async def check_failed_keys():
                 )
                 await key_manager.reset_key_failure_count(key)
             except Exception as e:
+                # 网络不可达属于链路问题，key 无辜：不计失败数，避免把全池 key 拉黑
+                category, _, _ = classify_and_extract(e)
+                if category == ErrorCategory.NETWORK:
+                    logger.warning(
+                        f"Key {log_key} verification skipped due to network "
+                        f"unreachability; failure count NOT incremented."
+                    )
+                    continue
                 logger.warning(
                     f"Key {log_key} verification failed: {str(e)}. Incrementing failure count."
                 )
@@ -114,6 +123,23 @@ async def cleanup_expired_files():
     except Exception as e:
         logger.error(
             f"An error occurred during the scheduled file cleanup: {str(e)}",
+            exc_info=True,
+        )
+
+
+async def cleanup_expired_key_model_states():
+    """清理 t_key_model_state 中冷却已过期且非今日的历史记录。"""
+    import datetime
+    from app.database.services import delete_expired_key_model_states
+
+    logger.info("Starting cleanup for expired key-model states...")
+    try:
+        before = datetime.datetime.now()
+        deleted = await delete_expired_key_model_states(before)
+        logger.info(f"Cleaned up {deleted} expired key-model state row(s).")
+    except Exception as e:
+        logger.error(
+            f"An error occurred during key-model state cleanup: {str(e)}",
             exc_info=True,
         )
 
@@ -171,6 +197,16 @@ def setup_scheduler():
         logger.info(
             f"File cleanup job scheduled to run every {cleanup_interval} hour(s)."
         )
+
+    # 清理过期的 (key, model) 限流状态（保留今日统计），每小时执行一次
+    scheduler.add_job(
+        cleanup_expired_key_model_states,
+        "interval",
+        hours=1,
+        id="cleanup_key_model_states_job",
+        name="Cleanup Key-Model States",
+    )
+    logger.info("Key-model state cleanup job scheduled to run every 1 hour(s).")
 
     scheduler.start()
     logger.info("Scheduler started with all jobs.")

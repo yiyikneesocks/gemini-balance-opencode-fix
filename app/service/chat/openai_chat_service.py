@@ -21,6 +21,7 @@ from app.log.logger import get_openai_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.image.image_create_service import ImageCreateService
 from app.service.key.key_manager import KeyManager
+from app.utils.helpers import extract_error_info
 
 logger = get_openai_logger()
 
@@ -338,8 +339,7 @@ class OpenAIChatService:
 
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"API call failed for model {model}: {error_log_msg}")
 
             # 特别记录 max_tokens 相关的错误
@@ -537,8 +537,7 @@ class OpenAIChatService:
             except Exception as e:
                 retries += 1
                 is_success = False
-                status_code = e.args[0]
-                error_log_msg = e.args[1]
+                status_code, error_log_msg = extract_error_info(e)
                 logger.warning(
                     f"Streaming API call failed with error: {error_log_msg}. Attempt {retries} of {max_retries} with key {current_attempt_key}"
                 )
@@ -650,8 +649,7 @@ class OpenAIChatService:
             yield "data: [DONE]\n\n"
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(error_log_msg)
             await add_error_log(
                 gemini_key=api_key,
@@ -704,8 +702,7 @@ class OpenAIChatService:
             return result
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(error_log_msg)
             await add_error_log(
                 gemini_key=api_key,

@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
@@ -10,7 +11,14 @@ from typing import Any, Dict, List, Optional, Union
 from sqlalchemy import asc, delete, desc, func, insert, select, update
 
 from app.database.connection import database
-from app.database.models import ErrorLog, FileRecord, FileState, RequestLog, Settings
+from app.database.models import (
+    ErrorLog,
+    FileRecord,
+    FileState,
+    KeyModelState,
+    RequestLog,
+    Settings,
+)
 from app.log.logger import get_database_logger
 from app.utils.helpers import redact_key_for_logging
 
@@ -138,12 +146,20 @@ async def add_error_log(
                 request_msg_json = None
 
         # 插入错误日志
+        if error_code is None:
+            normalized_error_code = None
+        else:
+            try:
+                normalized_error_code = int(error_code)
+            except (TypeError, ValueError):
+                normalized_error_code = None
+
         query = insert(ErrorLog).values(
             gemini_key=gemini_key,
             error_type=error_type,
             error_log=error_log,
             model_name=model_name,
-            error_code=error_code,
+            error_code=normalized_error_code,
             request_msg=request_msg_json,
             request_time=(request_datetime if request_datetime else datetime.now()),
         )
@@ -523,12 +539,21 @@ async def add_request_log(
     try:
         log_time = request_time if request_time else datetime.now()
 
+        # status_code 必须是整数或 NULL，空字符串会导致 MySQL 1366 写库失败
+        if status_code is None:
+            normalized_status_code = None
+        else:
+            try:
+                normalized_status_code = int(status_code)
+            except (TypeError, ValueError):
+                normalized_status_code = None
+
         query = insert(RequestLog).values(
             request_time=log_time,
             model_name=model_name,
             api_key=api_key,
             is_success=is_success,
-            status_code=status_code,
+            status_code=normalized_status_code,
             latency_ms=latency_ms,
         )
         await database.execute(query)
@@ -803,3 +828,114 @@ async def get_file_api_key(name: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to get file API key: {str(e)}")
         raise
+
+
+# ==================== (key, model) 限流状态持久化 ====================
+
+
+def _key_hash(api_key: str) -> str:
+    """API key 的 SHA256（用于落库，避免明文 key 泄漏）。"""
+    import hashlib
+
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+async def upsert_key_model_state(
+    api_key: str,
+    model_name: str,
+    kind: Optional[str] = None,
+    cooldown_until: Optional[datetime] = None,
+    last_error_time: Optional[datetime] = None,
+    consecutive_failures: Optional[int] = None,
+    error_code: Optional[int] = None,
+) -> bool:
+    """写入/更新 (key, model) 限流状态。"""
+    try:
+        key_hash = _key_hash(api_key)
+        masked = redact_key_for_logging(api_key)
+        query = select(KeyModelState).where(
+            (KeyModelState.key_hash == key_hash)
+            & (KeyModelState.model_name == model_name)
+        )
+        existing = await database.fetch_one(query)
+        if existing:
+            values: Dict[str, Any] = {"key_masked": masked}
+            if kind is not None:
+                values["kind"] = kind
+            if cooldown_until is not None:
+                values["cooldown_until"] = cooldown_until
+            if last_error_time is not None:
+                values["last_error_time"] = last_error_time
+            if consecutive_failures is not None:
+                values["consecutive_failures"] = consecutive_failures
+            if error_code is not None:
+                values["error_code"] = error_code
+            await database.execute(
+                update(KeyModelState)
+                .where(KeyModelState.id == existing["id"])
+                .values(**values)
+            )
+        else:
+            await database.execute(
+                insert(KeyModelState).values(
+                    key_hash=key_hash,
+                    key_masked=masked,
+                    model_name=model_name,
+                    kind=kind,
+                    cooldown_until=cooldown_until,
+                    last_error_time=last_error_time,
+                    consecutive_failures=consecutive_failures or 0,
+                    error_code=error_code,
+                )
+            )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upsert key model state: {str(e)}")
+        return False
+
+
+async def delete_key_model_state(api_key: str, model_name: str) -> bool:
+    """删除 (key, model) 状态（成功恢复时调用）。"""
+    try:
+        await database.execute(
+            delete(KeyModelState).where(
+                (KeyModelState.key_hash == _key_hash(api_key))
+                & (KeyModelState.model_name == model_name)
+            )
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete key model state: {str(e)}")
+        return False
+
+
+async def get_all_key_model_states() -> List[Dict[str, Any]]:
+    """读取全部 (key, model) 限流状态（启动时恢复用）。"""
+    try:
+        query = select(KeyModelState)
+        result = await database.fetch_all(query)
+        return [dict(row) for row in result]
+    except Exception as e:
+        logger.error(f"Failed to get key model states: {str(e)}")
+        return []
+
+
+async def delete_expired_key_model_states(before: datetime) -> int:
+    """清理 (key, model) 状态：冷却已过期 且 最近出错时间早于 before。
+
+    用途：删除历史残留（非今日、且已不在冷却中的记录），保留今日统计。
+    """
+    try:
+        result = await database.execute(
+            delete(KeyModelState).where(
+                (KeyModelState.cooldown_until < before)
+                & (
+                    (KeyModelState.last_error_time.is_(None))
+                    | (KeyModelState.last_error_time < before)
+                )
+            )
+        )
+        return result or 0
+    except Exception as e:
+        logger.error(f"Failed to delete expired key model states: {str(e)}")
+        return 0

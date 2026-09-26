@@ -14,7 +14,7 @@ from app.handler.stream_optimizer import gemini_optimizer
 from app.log.logger import get_gemini_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.key.key_manager import KeyManager
-from app.utils.helpers import redact_key_for_logging
+from app.utils.helpers import extract_error_info, redact_key_for_logging
 
 logger = get_gemini_logger()
 
@@ -277,8 +277,7 @@ class GeminiChatService:
             return self.response_handler.handle_response(response, model, stream=False)
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"Normal API call failed with error: {error_log_msg}")
 
             await add_error_log(
@@ -351,8 +350,7 @@ class GeminiChatService:
             except Exception as e:
                 retries += 1
                 is_success = False
-                status_code = e.args[0]
-                error_log_msg = e.args[1]
+                status_code, error_log_msg = extract_error_info(e)
                 logger.warning(
                     f"Streaming API call failed with error: {error_log_msg}. Attempt {retries} of {max_retries}"
                 )

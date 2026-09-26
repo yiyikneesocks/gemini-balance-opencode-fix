@@ -1,6 +1,7 @@
 # app/services/chat_service.py
 
 import datetime
+import asyncio
 import json
 import re
 import time
@@ -8,6 +9,8 @@ from typing import Any, AsyncGenerator, Dict, List
 
 from app.config.config import settings
 from app.core.constants import GEMINI_2_FLASH_EXP_SAFETY_SETTINGS
+from app.core.error_classifier import ErrorCategory, classify_and_extract
+from app.exception.exceptions import AllKeysCoolingError
 from app.database.services import add_error_log, add_request_log, get_file_api_key
 from app.domain.gemini_models import GeminiRequest
 from app.handler.response_handler import GeminiResponseHandler
@@ -15,7 +18,7 @@ from app.handler.stream_optimizer import gemini_optimizer
 from app.log.logger import get_gemini_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.key.key_manager import KeyManager
-from app.utils.helpers import redact_key_for_logging
+from app.utils.helpers import extract_error_info, redact_key_for_logging
 
 logger = get_gemini_logger()
 
@@ -240,13 +243,34 @@ def _ensure_valid_ending_turn(contents: List[Dict[str, Any]]) -> List[Dict[str, 
     proxy's _filter_empty_parts can additionally drop a trailing empty
     user turn, exposing a model turn. Append a minimal user turn to make
     the payload valid.
+
+    A trailing user turn whose parts are structurally non-empty but carry
+    no usable text (e.g. ``[{"text": ""}]``) is treated the same way, since
+    upstream strips empty text and would again end on a model turn.
     """
+
+    def _has_usable_part(parts: Any) -> bool:
+        if not isinstance(parts, list):
+            return False
+        for part in parts:
+            if not isinstance(part, dict) or not part:
+                continue
+            text = part.get("text")
+            if text is not None:
+                if isinstance(text, str) and text.strip():
+                    return True
+                continue
+            # Non-text parts (inlineData / fileData / functionCall / ...)
+            return True
+        return False
+
     if not contents:
         contents = []
     last = contents[-1] if contents else None
     last_role = (last or {}).get("role")
-    last_parts = (last or {}).get("parts")
-    if last is None or last_role == "model" or not last_parts:
+    if last is None or last_role == "model" or not _has_usable_part(
+        (last or {}).get("parts")
+    ):
         contents = list(contents)
         contents.append({"role": "user", "parts": [{"text": "continue"}]})
     return contents
@@ -357,6 +381,133 @@ class GeminiChatService:
             response_copy["candidates"][0]["content"]["parts"][0]["text"] = text
         return response_copy
 
+    async def _call_with_retry(self, call, api_key: str, model: str = ""):
+        """带分类的重试执行器（Gemini 原生路径）。
+
+        策略：
+        - network   : 同 key 指数退避重试 NETWORK_RETRY_ATTEMPTS 次，不计失败数；
+                      仍失败抛出明确网络错误。
+        - client    : 立即抛出（换 key 必然复现），不计数。
+        - auth      : 永久失败数 +2 快速拉黑，立即换 key。
+        - rate_limit / overload : 仅给 (key, model) 设置指数冷却（TPM/RPM 配额
+                      按模型计，一个模型 429 不代表其他模型不能用），不进永久
+                      失败数；换 key 时自动跳过该 (key, model) 组合。
+        - unknown   : 保守按永久失败 +1 处理，换 key。
+        全部 key 冷却中时等待最早到期（封顶配置）。
+        """
+        current_key = api_key
+        network_attempt = 0
+        max_network_retries = settings.NETWORK_RETRY_ATTEMPTS
+        switched_keys = 0
+
+        while True:
+            try:
+                return await call(current_key)
+            except Exception as e:
+                category, status_code, message = classify_and_extract(e)
+                logger.warning(
+                    f"Upstream call failed [{category.value}] status={status_code}: "
+                    f"{message[:200]}"
+                )
+
+                if category == ErrorCategory.NETWORK:
+                    network_attempt += 1
+                    if network_attempt >= max_network_retries:
+                        logger.error(
+                            f"Network unreachable after {network_attempt} attempts "
+                            f"on same key; giving up (key not penalized)"
+                        )
+                        raise
+                    backoff = settings.NETWORK_BACKOFF_BASE_S * (
+                        2 ** (network_attempt - 1)
+                    )
+                    logger.warning(
+                        f"Network error, retrying same key in {backoff:.1f}s "
+                        f"(attempt {network_attempt}/{max_network_retries})"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                # 非 network：按类别处理 key
+                if category == ErrorCategory.CLIENT:
+                    # 请求体问题，换 key 无意义也不记账
+                    raise
+                elif category == ErrorCategory.AUTH:
+                    async with self.key_manager.failure_count_lock:
+                        if current_key in self.key_manager.key_failure_counts:
+                            self.key_manager.key_failure_counts[current_key] += 2
+                elif category in (
+                    ErrorCategory.RATE_LIMIT_RPD,
+                    ErrorCategory.RATE_LIMIT_RPM,
+                    ErrorCategory.RATE_LIMIT,
+                    ErrorCategory.OVERLOAD,
+                ):
+                    # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
+                    # 优先用上游给的 retryDelay；RPD（日耗尽）用长冷却。
+                    from app.core.quota_parser import parse_quota_error
+
+                    body = e.args[1] if len(e.args) >= 2 else message
+                    quota = parse_quota_error(body if isinstance(body, str) else None)
+                    if category == ErrorCategory.RATE_LIMIT_RPD:
+                        await self.key_manager.mark_key_cooldown(
+                            current_key, model, kind="rpd"
+                        )
+                    elif quota and quota.retry_delay_s:
+                        await self.key_manager.mark_key_cooldown(
+                            current_key, model, seconds=quota.retry_delay_s
+                        )
+                    else:
+                        await self.key_manager.mark_key_cooldown(current_key, model)
+                else:  # unknown：保守记账
+                    async with self.key_manager.failure_count_lock:
+                        if current_key in self.key_manager.key_failure_counts:
+                            self.key_manager.key_failure_counts[current_key] += 1
+
+                switched_keys += 1
+                next_key = await self.key_manager.get_next_working_key(model)
+                if next_key:
+                    logger.info(
+                        f"Switched to new API key: {redact_key_for_logging(next_key)} "
+                        f"after {category.value} error"
+                    )
+                    current_key = next_key
+                    network_attempt = 0  # 换 key 后重新计算网络退避
+                    continue
+
+                # 无可用 key（全部冷却/失效）：等最早到期（封顶配置）后重取
+                wait_s = await self.key_manager.earliest_cooldown_release(model)
+                # 全部是 RPD 长冷却（日耗尽）时等待无意义，直接进入换模型提示
+                rpd_exhausted = (
+                    wait_s is not None
+                    and wait_s > settings.RPD_MIN_THRESHOLD_S
+                )
+                if wait_s and not rpd_exhausted:
+                    wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
+                    logger.warning(
+                        f"All keys cooling down for model={model or '_'}; "
+                        f"waiting {wait_s:.1f}s for earliest release"
+                    )
+                    await asyncio.sleep(wait_s)
+                    next_key = await self.key_manager.get_next_working_key(model)
+                    if next_key:
+                        current_key = next_key
+                        network_attempt = 0
+                        continue
+                logger.error(
+                    f"No available API key after {switched_keys} switches; failing"
+                )
+                hints = self.key_manager.get_available_models_hint(
+                    exclude_model=model
+                )
+                if rpd_exhausted:
+                    logger.error(
+                        f"All keys RPD-exhausted for model={model or '_'}; "
+                        f"suggesting model switch: {hints}"
+                    )
+                raise AllKeysCoolingError(
+                    model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
+                ) from e
+
     async def generate_content(
         self, model: str, request: GeminiRequest, api_key: str
     ) -> Dict[str, Any]:
@@ -384,14 +535,19 @@ class GeminiChatService:
         response = None
 
         try:
-            response = await self.api_client.generate_content(payload, model, api_key)
+            response = await self._call_with_retry(
+                lambda key: self.api_client.generate_content(payload, model, key),
+                api_key,
+                model,
+            )
             is_success = True
             status_code = 200
+            await self.key_manager.mark_key_success(api_key, model)
+            await self.key_manager.reset_permanent_failure_count(api_key)
             return self.response_handler.handle_response(response, model, stream=False)
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"Normal API call failed with error: {error_log_msg}")
 
             await add_error_log(
@@ -437,8 +593,7 @@ class GeminiChatService:
             return response
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"Count tokens API call failed with error: {error_log_msg}")
 
             await add_error_log(
@@ -482,23 +637,28 @@ class GeminiChatService:
                 )
 
         retries = 0
-        max_retries = settings.MAX_RETRIES
+        max_retries = max(settings.MAX_RETRIES, 3)  # 换 key 轮次上限
         payload = _build_payload(model, request)
         is_success = False
         status_code = None
         final_api_key = api_key
 
-        while retries < max_retries:
+        current_key = api_key
+        network_attempt = 0
+        max_network_retries = settings.NETWORK_RETRY_ATTEMPTS
+        first_chunk_sent = False
+
+        while True:
             request_datetime = datetime.datetime.now()
             start_time = time.perf_counter()
-            current_attempt_key = api_key
-            final_api_key = current_attempt_key
+            final_api_key = current_key
             try:
                 async for line in self.api_client.stream_generate_content(
-                    payload, model, current_attempt_key
+                    payload, model, current_key
                 ):
                     # print(line)
                     if line.startswith("data:"):
+                        first_chunk_sent = True
                         line = line[6:]
                         response_data = self.response_handler.handle_response(
                             json.loads(line), model, stream=True
@@ -521,18 +681,45 @@ class GeminiChatService:
                 logger.info("Streaming completed successfully")
                 is_success = True
                 status_code = 200
+                await self.key_manager.mark_key_success(current_key, model)
+                await self.key_manager.reset_permanent_failure_count(current_key)
                 break
             except Exception as e:
-                retries += 1
                 is_success = False
-                status_code = e.args[0]
-                error_log_msg = e.args[1]
+                category, status_code, error_log_msg = classify_and_extract(e)
                 logger.warning(
-                    f"Streaming API call failed with error: {error_log_msg}. Attempt {retries} of {max_retries}"
+                    f"Streaming API call failed [{category.value}] "
+                    f"status={status_code}: {error_log_msg[:200]}"
                 )
 
+                # 流已经开始输出：无法重试（会把两段流拼进同一个 SSE），直接抛
+                if first_chunk_sent:
+                    logger.error(
+                        "Stream already emitted chunks; aborting without retry "
+                        "to avoid corrupting the SSE stream"
+                    )
+                    raise
+
+                if category == ErrorCategory.NETWORK:
+                    network_attempt += 1
+                    if network_attempt >= max_network_retries:
+                        logger.error(
+                            f"Network unreachable after {network_attempt} attempts "
+                            f"on same key; giving up (key not penalized)"
+                        )
+                        raise
+                    backoff = settings.NETWORK_BACKOFF_BASE_S * (
+                        2 ** (network_attempt - 1)
+                    )
+                    logger.warning(
+                        f"Network error, retrying same key in {backoff:.1f}s "
+                        f"(attempt {network_attempt}/{max_network_retries})"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
                 await add_error_log(
-                    gemini_key=current_attempt_key,
+                    gemini_key=current_key,
                     model_name=model,
                     error_type="gemini-chat-stream",
                     error_log=error_log_msg,
@@ -543,20 +730,84 @@ class GeminiChatService:
                     request_datetime=request_datetime,
                 )
 
-                api_key = await self.key_manager.handle_api_failure(
-                    current_attempt_key, retries
-                )
-                if api_key:
-                    logger.info(
-                        f"Switched to new API key: {redact_key_for_logging(api_key)}"
-                    )
-                else:
-                    logger.error(f"No valid API key available after {retries} retries.")
+                if category == ErrorCategory.CLIENT:
                     raise
+                elif category == ErrorCategory.AUTH:
+                    async with self.key_manager.failure_count_lock:
+                        if current_key in self.key_manager.key_failure_counts:
+                            self.key_manager.key_failure_counts[current_key] += 2
+                elif category in (
+                    ErrorCategory.RATE_LIMIT_RPD,
+                    ErrorCategory.RATE_LIMIT_RPM,
+                    ErrorCategory.RATE_LIMIT,
+                    ErrorCategory.OVERLOAD,
+                ):
+                    # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
+                    # 优先用上游给的 retryDelay；RPD（日耗尽）用长冷却。
+                    from app.core.quota_parser import parse_quota_error
 
+                    body = e.args[1] if len(e.args) >= 2 else error_log_msg
+                    quota = parse_quota_error(body if isinstance(body, str) else None)
+                    if category == ErrorCategory.RATE_LIMIT_RPD:
+                        await self.key_manager.mark_key_cooldown(
+                            current_key, model, kind="rpd"
+                        )
+                    elif quota and quota.retry_delay_s:
+                        await self.key_manager.mark_key_cooldown(
+                            current_key, model, seconds=quota.retry_delay_s
+                        )
+                    else:
+                        await self.key_manager.mark_key_cooldown(current_key, model)
+                else:
+                    async with self.key_manager.failure_count_lock:
+                        if current_key in self.key_manager.key_failure_counts:
+                            self.key_manager.key_failure_counts[current_key] += 1
+
+                retries += 1
                 if retries >= max_retries:
-                    logger.error(f"Max retries ({max_retries}) reached for streaming.")
+                    logger.error(
+                        f"Max key switches ({max_retries}) reached for streaming."
+                    )
                     raise
+                next_key = await self.key_manager.get_next_working_key(model)
+                if next_key:
+                    logger.info(
+                        f"Switched to new API key: {redact_key_for_logging(next_key)} "
+                        f"after {category.value} error"
+                    )
+                    current_key = next_key
+                    network_attempt = 0
+                    continue
+
+                wait_s = await self.key_manager.earliest_cooldown_release(model)
+                rpd_exhausted = (
+                    wait_s is not None and wait_s > settings.RPD_MIN_THRESHOLD_S
+                )
+                if wait_s and not rpd_exhausted:
+                    wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
+                    logger.warning(
+                        f"All keys cooling down for model={model or '_'}; "
+                        f"waiting {wait_s:.1f}s for earliest release"
+                    )
+                    await asyncio.sleep(wait_s)
+                    next_key = await self.key_manager.get_next_working_key(model)
+                    if next_key:
+                        current_key = next_key
+                        network_attempt = 0
+                        continue
+
+                logger.error(f"No valid API key available after {retries} retries.")
+                hints = self.key_manager.get_available_models_hint(
+                    exclude_model=model
+                )
+                if rpd_exhausted:
+                    logger.error(
+                        f"All keys RPD-exhausted for model={model or '_'}; "
+                        f"suggesting model switch: {hints}"
+                    )
+                raise AllKeysCoolingError(
+                    model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
+                ) from e
             finally:
                 end_time = time.perf_counter()
                 latency_ms = int((end_time - start_time) * 1000)

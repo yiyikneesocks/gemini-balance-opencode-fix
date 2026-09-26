@@ -76,6 +76,56 @@ class ServiceUnavailableError(APIError):
         )
 
 
+class UpstreamNetworkError(APIError):
+    """上游 Gemini API 网络不可达错误"""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            status_code=503,
+            detail=f"Network error: {detail}. Please check network connectivity.",
+            error_code="network_error",
+        )
+
+
+class AllKeysCoolingError(APIError):
+    """指定模型的所有 key 都在冷却中（429/503 累积）。
+
+    - rpd_exhausted=False：瞬时限流，稍后重试即可，或尝试其他模型。
+    - rpd_exhausted=True ：该模型所有 key 的日配额已耗尽（RPD），重试无意义，
+      应当换模型（提示中会列出当前仍有配额的模型）。
+    """
+
+    def __init__(
+        self,
+        model: str = "",
+        retry_after_s: float = 0,
+        model_hints=None,
+        rpd_exhausted: bool = False,
+    ):
+        self.model_hints = list(model_hints or [])
+        self.retry_after_s = retry_after_s
+        self.rpd_exhausted = rpd_exhausted
+        model_part = f" for model '{model}'" if model else ""
+        if rpd_exhausted:
+            detail = (
+                f"Daily quota (RPD) for model '{model or 'requested model'}' is "
+                f"exhausted on all API keys. Retrying will NOT help until quota "
+                f"resets. Please switch to another model."
+            )
+        else:
+            detail = (
+                f"All API keys are rate-limited or cooling down{model_part}. "
+                f"Retry after ~{int(retry_after_s)}s if provided."
+                if retry_after_s
+                else f"All API keys are rate-limited or cooling down{model_part}."
+            )
+        if self.model_hints:
+            detail += (
+                f" Models with available quota: {', '.join(self.model_hints)}."
+            )
+        super().__init__(status_code=429, detail=detail, error_code="all_keys_cooling")
+
+
 def setup_exception_handlers(app: FastAPI) -> None:
     """
     设置应用程序的异常处理器

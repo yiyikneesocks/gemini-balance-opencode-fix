@@ -18,7 +18,7 @@ from app.service.image.image_create_service import ImageCreateService
 from app.service.key.key_manager import KeyManager, get_key_manager_instance
 from app.service.model.model_service import ModelService
 from app.service.tts.tts_service import TTSService
-from app.utils.helpers import redact_key_for_logging
+from app.utils.helpers import extract_error_info, redact_key_for_logging
 
 router = APIRouter()
 logger = get_openai_logger()
@@ -112,10 +112,11 @@ async def chat_completion(
                 # 如果流直接结束，退回标准 SSE 输出
                 return StreamingResponse(raw_response, media_type="text/event-stream")
             except Exception as e:
-                # 初始化流异常，直接返回 500 错误
+                # 初始化流异常，返回明确的状态码与错误信息（含网络不可达）
+                status_code, error_message = extract_error_info(e)
                 return JSONResponse(
-                    content={"error": {"code": e.args[0], "message": e.args[1]}},
-                    status_code=e.args[0],
+                    content={"error": {"code": status_code, "message": error_message}},
+                    status_code=status_code,
                 )
 
             # 如果以 "data:" 开头，代表正常 SSE，将首块和后续块一起发送

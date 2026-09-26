@@ -10,6 +10,7 @@ from app.domain.gemini_models import GeminiBatchEmbedRequest, GeminiEmbedRequest
 from app.log.logger import get_gemini_embedding_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.key.key_manager import KeyManager
+from app.utils.helpers import extract_error_info
 
 logger = get_gemini_embedding_logger()
 
@@ -68,8 +69,7 @@ class GeminiEmbeddingService:
             return response
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"Single embedding API call failed: {error_log_msg}")
 
             await add_error_log(
@@ -114,8 +114,7 @@ class GeminiEmbeddingService:
             return response
         except Exception as e:
             is_success = False
-            status_code = e.args[0]
-            error_log_msg = e.args[1]
+            status_code, error_log_msg = extract_error_info(e)
             logger.error(f"Batch embedding API call failed: {error_log_msg}")
 
             await add_error_log(

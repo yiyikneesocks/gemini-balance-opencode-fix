@@ -1,7 +1,7 @@
 import asyncio
 from copy import deepcopy
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config.config import settings
@@ -23,7 +23,7 @@ from app.service.embedding.gemini_embedding_service import GeminiEmbeddingServic
 from app.service.key.key_manager import KeyManager, get_key_manager_instance
 from app.service.model.model_service import ModelService
 from app.service.tts.native.tts_routes import get_tts_chat_service
-from app.utils.helpers import redact_key_for_logging
+from app.utils.helpers import extract_error_info, redact_key_for_logging
 
 router = APIRouter(prefix=f"/gemini/{API_VERSION}")
 router_v1beta = APIRouter(prefix=f"/{API_VERSION}")
@@ -38,9 +38,41 @@ async def get_key_manager():
     return await get_key_manager_instance()
 
 
-async def get_next_working_key(key_manager: KeyManager = Depends(get_key_manager)):
-    """获取下一个可用的API密钥"""
-    return await key_manager.get_next_working_key()
+async def get_next_working_key(
+    request: Request,
+    key_manager: KeyManager = Depends(get_key_manager),
+):
+    """按请求中的模型获取下一个可用 key；全部冷却时有限等待最早到期。
+
+    模型从请求体解析（429/503 的 TPM/RPM 配额按模型计，冷却必须模型隔离）。
+    """
+    model = ""
+    try:
+        body = await request.json()
+        model = (body.get("model") or "").split(":")[0]
+    except Exception:
+        pass
+    key = await key_manager.get_next_working_key(model)
+    if key:
+        return key
+    # 所有 key 都在冷却：等最早到期的 key（封顶 ALL_COOLING_MAX_WAIT_S）再取一次
+    wait_s = await key_manager.earliest_cooldown_release(model)
+    if wait_s:
+        wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
+        logger.info(
+            f"All keys cooling down for model={model or '_'}; waiting "
+            f"{wait_s:.1f}s for earliest release"
+        )
+        await asyncio.sleep(wait_s)
+        key = await key_manager.get_next_working_key(model)
+    if not key:
+        # 仍无可用 key：返回 429 语义 + 建议换模型（客户端侧自行退避重试）
+        hints = key_manager.get_available_models_hint(exclude_model=model)
+        detail = "All API keys are cooling down or invalid. Try again later."
+        if hints:
+            detail += f" Or switch to a model with available quota, e.g. {', '.join(hints)}."
+        raise HTTPException(status_code=429, detail=detail)
+    return key
 
 
 async def get_chat_service(key_manager: KeyManager = Depends(get_key_manager)):
@@ -123,7 +155,6 @@ async def list_models(
 
 @router.post("/models/{model_name}:generateContent")
 @router_v1beta.post("/models/{model_name}:generateContent")
-@RetryHandler(key_arg="api_key")
 async def generate_content(
     model_name: str,
     request: GeminiRequest,
@@ -187,7 +218,6 @@ async def generate_content(
 
 @router.post("/models/{model_name}:streamGenerateContent")
 @router_v1beta.post("/models/{model_name}:streamGenerateContent")
-@RetryHandler(key_arg="api_key")
 async def stream_generate_content(
     model_name: str,
     request: GeminiRequest,
@@ -223,10 +253,11 @@ async def stream_generate_content(
             # 如果流直接结束，退回标准 SSE 输出
             return StreamingResponse(raw_stream, media_type="text/event-stream")
         except Exception as e:
-            # 初始化流异常，直接返回 500 错误
+            # 初始化流异常，返回明确的状态码与错误信息（含网络不可达）
+            status_code, error_message = extract_error_info(e)
             return JSONResponse(
-                content={"error": {"code": e.args[0], "message": e.args[1]}},
-                status_code=e.args[0],
+                content={"error": {"code": status_code, "message": error_message}},
+                status_code=status_code,
             )
 
         # 如果以 "data:" 开头，代表正常 SSE，将首块和后续块一起发送
@@ -515,7 +546,7 @@ async def verify_key(
                     f"Verification exception for key: {redact_key_for_logging(api_key)}, incrementing failure count"
                 )
 
-        return JSONResponse({"status": "invalid", "error": e.args[1]})
+        return JSONResponse({"status": "invalid", "error": extract_error_info(e)[1]})
 
 
 @router.post("/verify-selected-keys")
@@ -559,7 +590,7 @@ async def verify_selected_keys(
             await key_manager.reset_key_failure_count(api_key)
             return api_key, "valid", None
         except Exception as e:
-            error_message = e.args[1]
+            error_code, error_message = extract_error_info(e)
             logger.warning(
                 f"Key verification failed for {redact_key_for_logging(api_key)}: {error_message}"
             )
@@ -574,7 +605,7 @@ async def verify_selected_keys(
                     logger.warning(
                         f"Bulk verification exception for key: {redact_key_for_logging(api_key)}, initializing failure count to 1"
                     )
-            failed_keys[api_key] = {"error_message": e.args[1], "error_code": e.args[0]}
+            failed_keys[api_key] = {"error_message": error_message, "error_code": error_code}
             return api_key, "invalid", error_message
 
     tasks = [_verify_single_key(key) for key in keys_to_verify]
