@@ -18,6 +18,12 @@
 > ⚠️ **Important**: This project is licensed under the [CC BY-NC 4.0](LICENSE) license. **Any form of commercial resale service is prohibited**.
 > I have never sold this service on any platform. If you encounter someone selling this service, they are a reseller. Please do not be deceived.
 
+> 🔧 **This is a fork.** Upstream: **snailyp/gemini-balance** (https://github.com/snailyp/gemini-balance).
+> This fork adds a set of fixes for running the proxy with **opencode**: upstream
+> error classification with per-`(key, model)` cooldowns, daily-quota (RPD) handling,
+> MySQL persistence of cooldown/statistics, and a `/model-cooldown` dashboard.
+> See [FORK_NOTES.md](./FORK_NOTES.md) and [CHANGELOG.md](./CHANGELOG.md).
+
 ---
 
 ## 📖 Project Introduction

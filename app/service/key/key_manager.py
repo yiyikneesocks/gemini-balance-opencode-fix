@@ -39,6 +39,14 @@ class KeyManager:
         # 今日出过错的事件记录（与冷却状态分离）：km_id -> {"last_error_time", "last_kind", "last_error_code"}
         # 用于监控页展示"今日已调用出错的模型"，即使冷却已过期也能看到。
         self.key_model_error_today: Dict[str, Dict[str, Any]] = {}
+        # 成功调用次数（按太平洋日统计）："<pacific_day>::<key>::<model>" -> count
+        # 用于监控页展示每个 (key, model) 当天成功了多少次。
+        self.key_model_success_count: Dict[str, int] = {}
+        # 负载均衡：全局选中序号 + 每个 key 最近一次被选中的序号（用于同次数轮转）
+        self._pick_seq: int = 0
+        self._key_last_picked_seq: Dict[str, int] = {}
+        # 每个模型上一次选中的 key（避免连续命中同一把，规避单 key RPM 突发）
+        self._last_picked_key: Dict[str, str] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -79,6 +87,8 @@ class KeyManager:
         seconds: Optional[float] = None,
         until: Optional[float] = None,
         kind: str = "rpm",
+        error_log: str = "",
+        error_code: Optional[int] = None,
     ) -> float:
         """给 (key, model) 设置冷却（429/503 时调用），返回本次冷却秒数。
 
@@ -92,10 +102,17 @@ class KeyManager:
             # 记录今日出错事件（监控页用，与冷却是否过期无关）
             import datetime
 
-            self.key_model_error_today[km_id] = {
-                "last_error_time": datetime.datetime.now().strftime("%H:%M:%S"),
-                "last_kind": kind,
-            }
+            event = self.key_model_error_today.get(km_id, {})
+            event.update(
+                {
+                    "last_error_time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "last_kind": kind,
+                    "last_error_log": (error_log or "")[:8000],
+                    "last_error_code": error_code,
+                }
+            )
+            event["error_count"] = event.get("error_count", 0) + 1
+            self.key_model_error_today[km_id] = event
             if kind == "rpd":
                 # 日耗尽：连续失败计数不再有意义，冷却时长由 until 决定
                 self.key_model_consecutive_failures[km_id] = (
@@ -128,29 +145,91 @@ class KeyManager:
         )
         # 持久化到数据库，保证重启后冷却与统计不丢失
         await self._persist_key_model_state(
-            key, model or "_", kind, cooldown, error_code=429
+            key,
+            model or "_",
+            kind,
+            cooldown,
+            error_code=error_code or 429,
+            error_log=error_log,
         )
         return cooldown
 
-    async def _persist_key_model_state(
-        self, key: str, model: str, kind: str, cooldown_s: float, error_code: int = None
+    async def note_error(
+        self,
+        key: str,
+        model: str = "",
+        kind: str = "network",
+        error_log: str = "",
+        error_code: Optional[int] = None,
     ) -> None:
-        """把 (key, model) 冷却状态写入数据库。失败仅记日志，不影响主流程。"""
+        """记录一次"不惩罚 key"的错误（如网络不可达 / 客户端 400）。
+
+        不设置任何冷却、不改失败计数，仅用于监控页展示"今日出错"。
+        """
+        import datetime
+
+        km_id = self._km_id(key, model or "_")
+        async with self.failure_count_lock:
+            self._roll_error_day_if_needed()
+            event = self.key_model_error_today.get(km_id, {})
+            event.update(
+                {
+                    "last_error_time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "last_kind": kind,
+                    "last_error_log": (error_log or "")[:8000],
+                    "last_error_code": error_code,
+                }
+            )
+            event["error_count"] = event.get("error_count", 0) + 1
+            self.key_model_error_today[km_id] = event
+        # 仅记录事件与计数，不写冷却
+        await self._persist_key_model_state(
+            key,
+            model or "_",
+            kind,
+            0.0,
+            error_code=error_code,
+            error_log=error_log,
+        )
+
+    async def _persist_key_model_state(
+        self,
+        key: str,
+        model: str,
+        kind: str,
+        cooldown_s: float,
+        error_code: int = None,
+        error_log: str = "",
+    ) -> None:
+        """把 (key, model) 状态写入数据库。失败仅记日志，不影响主流程。
+
+        cooldown_s <= 0 表示"仅记录事件，不设冷却"（如网络错误），
+        此时不传 cooldown_until，避免覆盖已有的更长冷却。
+        """
         try:
             import datetime
             from app.database.services import upsert_key_model_state
 
+            km_id = self._km_id(key, model)
+            event = self.key_model_error_today.get(km_id, {})
+            cooldown_until = (
+                datetime.datetime.now() + datetime.timedelta(seconds=cooldown_s)
+                if cooldown_s and cooldown_s > 0
+                else None
+            )
             await upsert_key_model_state(
                 api_key=key,
                 model_name=model,
                 kind=kind,
-                cooldown_until=datetime.datetime.now()
-                + datetime.timedelta(seconds=cooldown_s),
+                cooldown_until=cooldown_until,
                 last_error_time=datetime.datetime.now(),
                 consecutive_failures=self.key_model_consecutive_failures.get(
-                    self._km_id(key, model), 0
+                    km_id, 0
                 ),
                 error_code=error_code,
+                last_error_log=(error_log or "")[:8000],
+                error_count=event.get("error_count", 0),
+                stat_day=self._pacific_day_str(),
             )
         except Exception as e:
             logger.warning(f"Failed to persist key model state: {e}")
@@ -204,7 +283,16 @@ class KeyManager:
                 self.key_model_error_today[km_id] = {
                     "last_error_time": last_error_time.strftime("%H:%M:%S"),
                     "last_kind": kind,
+                    "last_error_log": row.get("last_error_log") or "",
+                    "last_error_code": row.get("error_code"),
+                    "error_count": row.get("error_count") or 0,
                 }
+            # 今日成功计数（按太平洋日；跨日则忽略）
+            stat_day = row.get("stat_day")
+            if stat_day and stat_day == self._pacific_day_str():
+                self.key_model_success_count[f"{stat_day}::{km_id}"] = (
+                    row.get("success_count") or 0
+                )
         self.error_today_day = now_dt.strftime("%Y-%m-%d")
         if restored:
             logger.info(
@@ -235,34 +323,110 @@ class KeyManager:
         except Exception:
             return settings.RPD_COOLDOWN_HOURS * 3600.0
 
+    @staticmethod
+    def _pacific_day_str() -> str:
+        """当前太平洋时间（America/Los_Angeles）的日期字符串，作为"一天"的边界。
+
+        配额按太平洋时间重置，因此"今日统计"也按太平洋日切分。
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime
+
+            return datetime.datetime.now(ZoneInfo("America/Los_Angeles")).strftime(
+                "%Y-%m-%d"
+            )
+        except Exception:
+            import datetime
+
+            return datetime.datetime.now().strftime("%Y-%m-%d")
+
+    def get_success_count(self, key: str, model: str) -> int:
+        """该 (key, model) 在太平洋日内的成功调用次数。"""
+        return self.key_model_success_count.get(
+            f"{self._pacific_day_str()}::{self._km_id(key, model)}", 0
+        )
+
+    def pick_rpd_probe_key(self, model: str, exclude: Optional[set] = None) -> Optional[str]:
+        """全池 RPD 耗尽时，挑一个最佳"探测"key（其 RPD 冷却剩余最少/最早到期）。
+
+        用于「即使 RPD 耗尽也再试一两轮」——因为配额可能已提前重置，
+        或本地判断有误。exclude 用于避免连续探测同一把 key。
+        """
+        exclude = exclude or set()
+        best_key: Optional[str] = None
+        best_remaining: Optional[float] = None
+        for key in self.api_keys:
+            if key in exclude:
+                continue
+            km_id = self._km_id(key, model or "_")
+            remaining = self.key_model_cooldown_until.get(km_id, 0.0) - time.monotonic()
+            if remaining <= 0:
+                continue  # 未冷却的会被 get_next_working_key 正常处理
+            if best_remaining is None or remaining < best_remaining:
+                best_remaining = remaining
+                best_key = key
+        return best_key
+
     def is_key_rpd_exhausted(self, key: str, model: str = "") -> bool:
         """该 (key, model) 是否处于日配额耗尽（长冷却）状态。"""
         km_id = self._km_id(key, model or "_")
         remaining = self.key_model_cooldown_until.get(km_id, 0.0) - time.monotonic()
         return remaining > settings.RPD_MIN_THRESHOLD_S
 
+    def all_keys_rpd_exhausted(self, model: str = "") -> bool:
+        """该模型下是否**所有** key 都处于 RPD 日耗尽状态。
+
+        仅当每一把 key 都被判定为 RPD 长冷却时才返回 True。只要有一把 key
+        不是 RPD（例如只是 RPM 短冷却，或根本未冷却），就返回 False——
+        此时应作为"稍后重试"处理，而不是误报"RPD 全部耗尽"。
+        """
+        if not self.api_keys:
+            return False
+        return all(self.is_key_rpd_exhausted(key, model) for key in self.api_keys)
+
     async def mark_key_success(self, key: str, model: str = "") -> None:
-        """请求成功：清零该 (key, model) 冷却与连续失败计数，并清除数据库记录。"""
+        """请求成功：累计今日成功次数，清零该 (key, model) 冷却与连续失败计数。
+
+        注意：不清除今日的出错计数（那是按太平洋日累计的），只清冷却。
+        """
         km_id = self._km_id(key, model or "_")
-        had_state = False
+        had_cooldown = False
         async with self.failure_count_lock:
-            had_state = (
-                self.key_model_cooldown_until.get(km_id, 0.0) > 0.0
-                or km_id in self.key_model_error_today
-                or self.key_model_consecutive_failures.get(km_id, 0) > 0
-            )
+            had_cooldown = self.key_model_cooldown_until.get(km_id, 0.0) > 0.0
             self.key_model_cooldown_until[km_id] = 0.0
             self.key_model_consecutive_failures[km_id] = 0
-            # 成功后不再算"今日出错"，从监控列表移除
-            self.key_model_error_today.pop(km_id, None)
-        # 仅当之前确实有状态时才写库，避免每次成功请求都打一次 DB
-        if had_state:
-            try:
-                from app.database.services import delete_key_model_state
+            # 保留 key_model_error_today 的 error_count（今日累计），仅清掉冷却标记
+            if km_id in self.key_model_error_today:
+                self.key_model_error_today[km_id]["cooling"] = False
+            # 累计太平洋日内的成功调用次数
+            day = self._pacific_day_str()
+            stat_key = f"{day}::{km_id}"
+            self.key_model_success_count[stat_key] = (
+                self.key_model_success_count.get(stat_key, 0) + 1
+            )
+            self._roll_success_day_if_needed(day)
+        # 清冷却 + 累加成功数（保留今日错误计数）
+        try:
+            from app.database.services import increment_key_model_success
 
-                await delete_key_model_state(key, model or "_")
+            await increment_key_model_success(key, model or "_", self._pacific_day_str())
+        except Exception as e:
+            logger.warning(f"Failed to persist success count: {e}")
+        if had_cooldown:
+            try:
+                from app.database.services import clear_key_model_cooldown
+
+                await clear_key_model_cooldown(key, model or "_")
             except Exception as e:
-                logger.warning(f"Failed to clear key model state: {e}")
+                logger.warning(f"Failed to clear key model cooldown: {e}")
+
+    def _roll_success_day_if_needed(self, today: Optional[str] = None) -> None:
+        """跨太平洋日时清空上一日的成功计数（内存）。在持有锁时调用。"""
+        today = today or self._pacific_day_str()
+        stale = [k for k in self.key_model_success_count if not k.startswith(f"{today}::")]
+        for k in stale:
+            self.key_model_success_count.pop(k, None)
 
     def _is_key_cooling(self, key: str, model: str = "") -> bool:
         km_id = self._km_id(key, model or "_")
@@ -339,6 +503,10 @@ class KeyManager:
                     "kind": kind,
                     "remaining_s": round(remaining, 1),
                     "last_error_time": ev.get("last_error_time", ""),
+                    "last_error_log": ev.get("last_error_log", ""),
+                    "last_error_code": ev.get("last_error_code"),
+                    "error_count": ev.get("error_count", 0),
+                    "success_count": self.get_success_count(key, model),
                 }
             )
         # 最早恢复只统计仍在冷却的；全过期则 0
@@ -508,24 +676,72 @@ class KeyManager:
     async def get_next_working_key(self, model: str = "") -> Optional[str]:
         """获取指定模型下一可用 key：跳过失效（失败数超限）与冷却中的 (key, model)。
 
+        负载均衡策略（BALANCE_BY_SUCCESS_COUNT）：
+        1. 先排除"上一次刚选过"的 key（若还有其他可用 key），避免短时间内
+           反复命中同一把 key 而触发单 key RPM 限流；
+        2. 在剩余可用 key 中，优先选"今日成功次数最少"的一把，把当日总量摊平；
+        3. 同成功次数时按内部计数器轮转，避免固定偏袒某个 key。
+
+        即：真正的"限流规避"交给 (key, model) 冷却，本函数只负责把请求尽量
+        均匀地分派到不同 key，而不是把某一把 key 连续刷到冷却。
         若所有 key 都在冷却，返回 None，由调用方决定等待最早到期或直接失败。
         """
+        # 收集所有当前可用（有效且未冷却）的 key
+        available: list = []
+        for key in self.api_keys:
+            if self.key_failure_counts.get(key, 0) >= self.MAX_FAILURES:
+                continue
+            if self._is_key_cooling(key, model):
+                continue
+            available.append(key)
+
+        if not available:
+            return None
+
+        if settings.BALANCE_BY_SUCCESS_COUNT:
+            # 避免连续命中同一把 key（防单 key RPM 突发）：若上次选中的 key 仍在
+            # 可用集合里且有其他可用 key，本轮先把它排除，靠"换 key"分摊瞬时压力。
+            last = self._last_picked_key.get(model or "_")
+            candidates = (
+                [k for k in available if k != last]
+                if len(available) > 1 and last in available
+                else available
+            )
+            picked = self._pick_least_used_key(candidates, model)
+            self._pick_seq += 1
+            self._key_last_picked_seq[picked] = self._pick_seq
+            self._last_picked_key[model or "_"] = picked
+            return picked
+
+        # 保留原有轮询语义（未开启均衡时）
         async with self.key_cycle_lock:
             initial_key = next(self.key_cycle)
         current_key = initial_key
-
         while True:
-            if (
-                await self.is_key_valid(current_key)
-                and not self._is_key_cooling(current_key, model)
-            ):
+            if current_key in available:
                 return current_key
-
             async with self.key_cycle_lock:
                 current_key = next(self.key_cycle)
             if current_key == initial_key:
-                # 轮完一圈：全都在失效/冷却中
-                return None
+                return available[0]
+
+    def _pick_least_used_key(self, available: list, model: str) -> str:
+        """在候选 key 中按 (今日成功次数, 最近使用序号) 选最优。
+
+        - 首先比今日成功次数，越少越优先（摊平衡量）；
+        - 同次数时，选"最近最少被选中"的 key（recency 最小），保证轮转公平，
+          不会因排序固定而饿死后面的 key。
+        """
+        best_key = None
+        best_metric = None  # (success_count, recency)
+        for k in available:
+            cnt = self.get_success_count(k, model)
+            recency = self._key_last_picked_seq.get(k, 0)
+            metric = (cnt, recency)
+            if best_metric is None or metric < best_metric:
+                best_metric = metric
+                best_key = k
+        return best_key or available[0]
 
     async def get_next_working_vertex_key(self) -> str:
         """获取下一可用的 Vertex Express API key"""

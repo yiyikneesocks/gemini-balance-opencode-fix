@@ -399,6 +399,8 @@ class GeminiChatService:
         network_attempt = 0
         max_network_retries = settings.NETWORK_RETRY_ATTEMPTS
         switched_keys = 0
+        rpd_probe = 0
+        self._rpd_probed_keys: set = set()
 
         while True:
             try:
@@ -411,6 +413,14 @@ class GeminiChatService:
                 )
 
                 if category == ErrorCategory.NETWORK:
+                    # 记录到监控（不计惩罚、不设冷却），便于看到今日网络错误
+                    await self.key_manager.note_error(
+                        current_key,
+                        model,
+                        kind="network",
+                        error_log=message,
+                        error_code=status_code,
+                    )
                     network_attempt += 1
                     if network_attempt >= max_network_retries:
                         logger.error(
@@ -430,7 +440,14 @@ class GeminiChatService:
 
                 # 非 network：按类别处理 key
                 if category == ErrorCategory.CLIENT:
-                    # 请求体问题，换 key 无意义也不记账
+                    # 请求体问题，换 key 无意义也不记账；仅记录到监控
+                    await self.key_manager.note_error(
+                        current_key,
+                        model,
+                        kind="client",
+                        error_log=message,
+                        error_code=status_code,
+                    )
                     raise
                 elif category == ErrorCategory.AUTH:
                     async with self.key_manager.failure_count_lock:
@@ -450,14 +467,27 @@ class GeminiChatService:
                     quota = parse_quota_error(body if isinstance(body, str) else None)
                     if category == ErrorCategory.RATE_LIMIT_RPD:
                         await self.key_manager.mark_key_cooldown(
-                            current_key, model, kind="rpd"
+                            current_key,
+                            model,
+                            kind="rpd",
+                            error_log=message,
+                            error_code=status_code,
                         )
                     elif quota and quota.retry_delay_s:
                         await self.key_manager.mark_key_cooldown(
-                            current_key, model, seconds=quota.retry_delay_s
+                            current_key,
+                            model,
+                            seconds=quota.retry_delay_s,
+                            error_log=message,
+                            error_code=status_code,
                         )
                     else:
-                        await self.key_manager.mark_key_cooldown(current_key, model)
+                        await self.key_manager.mark_key_cooldown(
+                            current_key,
+                            model,
+                            error_log=message,
+                            error_code=status_code,
+                        )
                 else:  # unknown：保守记账
                     async with self.key_manager.failure_count_lock:
                         if current_key in self.key_manager.key_failure_counts:
@@ -476,21 +506,39 @@ class GeminiChatService:
 
                 # 无可用 key（全部冷却/失效）：等最早到期（封顶配置）后重取
                 wait_s = await self.key_manager.earliest_cooldown_release(model)
-                # 全部是 RPD 长冷却（日耗尽）时等待无意义，直接进入换模型提示
-                rpd_exhausted = (
-                    wait_s is not None
-                    and wait_s > settings.RPD_MIN_THRESHOLD_S
-                )
+                # 仅当"每一把 key 都是 RPD 日耗尽"时才算 RPD 全耗尽；
+                # 部分 RPD、部分 RPM 的情况按"稍后可重试"处理，不误报 RPD。
+                rpd_exhausted = self.key_manager.all_keys_rpd_exhausted(model)
                 if wait_s and not rpd_exhausted:
                     wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
                     logger.warning(
-                        f"All keys cooling down for model={model or '_'}; "
-                        f"waiting {wait_s:.1f}s for earliest release"
+                        f"All keys cooling down for model={model or '_'} "
+                        f"(not all RPD-exhausted); waiting {wait_s:.1f}s "
+                        f"for earliest release"
                     )
                     await asyncio.sleep(wait_s)
                     next_key = await self.key_manager.get_next_working_key(model)
                     if next_key:
                         current_key = next_key
+                        network_attempt = 0
+                        continue
+                    # 等待后仍无 key：重新评估是否已变成全 RPD 耗尽
+                    rpd_exhausted = self.key_manager.all_keys_rpd_exhausted(model)
+                # 全池 RPD 耗尽：配额可能已重置，再探测重试 RPD_PROBE_ATTEMPTS 轮
+                if rpd_exhausted and rpd_probe < settings.RPD_PROBE_ATTEMPTS:
+                    probe_key = self.key_manager.pick_rpd_probe_key(
+                        model, exclude=self._rpd_probed_keys
+                    )
+                    if probe_key:
+                        rpd_probe += 1
+                        self._rpd_probed_keys.add(probe_key)
+                        logger.warning(
+                            f"All keys RPD-exhausted for model={model or '_'}, but "
+                            f"probing key {redact_key_for_logging(probe_key)} anyway "
+                            f"(attempt {rpd_probe}/{settings.RPD_PROBE_ATTEMPTS}); "
+                            f"quota may have reset"
+                        )
+                        current_key = probe_key
                         network_attempt = 0
                         continue
                 logger.error(
@@ -647,6 +695,8 @@ class GeminiChatService:
         network_attempt = 0
         max_network_retries = settings.NETWORK_RETRY_ATTEMPTS
         first_chunk_sent = False
+        rpd_probe = 0
+        self._rpd_probed_keys: set = set()
 
         while True:
             request_datetime = datetime.datetime.now()
@@ -701,6 +751,14 @@ class GeminiChatService:
                     raise
 
                 if category == ErrorCategory.NETWORK:
+                    # 记录到监控（不计惩罚、不设冷却），便于看到今日网络错误
+                    await self.key_manager.note_error(
+                        current_key,
+                        model,
+                        kind="network",
+                        error_log=error_log_msg,
+                        error_code=status_code,
+                    )
                     network_attempt += 1
                     if network_attempt >= max_network_retries:
                         logger.error(
@@ -731,6 +789,13 @@ class GeminiChatService:
                 )
 
                 if category == ErrorCategory.CLIENT:
+                    await self.key_manager.note_error(
+                        current_key,
+                        model,
+                        kind="client",
+                        error_log=error_log_msg,
+                        error_code=status_code,
+                    )
                     raise
                 elif category == ErrorCategory.AUTH:
                     async with self.key_manager.failure_count_lock:
@@ -750,14 +815,27 @@ class GeminiChatService:
                     quota = parse_quota_error(body if isinstance(body, str) else None)
                     if category == ErrorCategory.RATE_LIMIT_RPD:
                         await self.key_manager.mark_key_cooldown(
-                            current_key, model, kind="rpd"
+                            current_key,
+                            model,
+                            kind="rpd",
+                            error_log=error_log_msg,
+                            error_code=status_code,
                         )
                     elif quota and quota.retry_delay_s:
                         await self.key_manager.mark_key_cooldown(
-                            current_key, model, seconds=quota.retry_delay_s
+                            current_key,
+                            model,
+                            seconds=quota.retry_delay_s,
+                            error_log=error_log_msg,
+                            error_code=status_code,
                         )
                     else:
-                        await self.key_manager.mark_key_cooldown(current_key, model)
+                        await self.key_manager.mark_key_cooldown(
+                            current_key,
+                            model,
+                            error_log=error_log_msg,
+                            error_code=status_code,
+                        )
                 else:
                     async with self.key_manager.failure_count_lock:
                         if current_key in self.key_manager.key_failure_counts:
@@ -780,19 +858,39 @@ class GeminiChatService:
                     continue
 
                 wait_s = await self.key_manager.earliest_cooldown_release(model)
-                rpd_exhausted = (
-                    wait_s is not None and wait_s > settings.RPD_MIN_THRESHOLD_S
-                )
+                # 仅当每一把 key 都是 RPD 日耗尽时才算 RPD 全耗尽；
+                # 部分 RPD、部分 RPM 的情况按"稍后可重试"处理，不误报 RPD。
+                rpd_exhausted = self.key_manager.all_keys_rpd_exhausted(model)
                 if wait_s and not rpd_exhausted:
                     wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
                     logger.warning(
-                        f"All keys cooling down for model={model or '_'}; "
-                        f"waiting {wait_s:.1f}s for earliest release"
+                        f"All keys cooling down for model={model or '_'} "
+                        f"(not all RPD-exhausted); waiting {wait_s:.1f}s "
+                        f"for earliest release"
                     )
                     await asyncio.sleep(wait_s)
                     next_key = await self.key_manager.get_next_working_key(model)
                     if next_key:
                         current_key = next_key
+                        network_attempt = 0
+                        continue
+                    # 等待后仍无 key：重新评估是否已变成全 RPD 耗尽
+                    rpd_exhausted = self.key_manager.all_keys_rpd_exhausted(model)
+                # 全池 RPD 耗尽：配额可能已重置，再探测重试 RPD_PROBE_ATTEMPTS 轮
+                if rpd_exhausted and rpd_probe < settings.RPD_PROBE_ATTEMPTS:
+                    probe_key = self.key_manager.pick_rpd_probe_key(
+                        model, exclude=self._rpd_probed_keys
+                    )
+                    if probe_key:
+                        rpd_probe += 1
+                        self._rpd_probed_keys.add(probe_key)
+                        logger.warning(
+                            f"All keys RPD-exhausted for model={model or '_'}, but "
+                            f"probing key {redact_key_for_logging(probe_key)} anyway "
+                            f"(attempt {rpd_probe}/{settings.RPD_PROBE_ATTEMPTS}); "
+                            f"quota may have reset"
+                        )
+                        current_key = probe_key
                         network_attempt = 0
                         continue
 

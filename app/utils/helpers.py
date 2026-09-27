@@ -200,8 +200,14 @@ def extract_error_info(e: Exception) -> Tuple[Any, str]:
         return e.status_code, e.detail
 
     if isinstance(e, httpx.HTTPError):
+        try:
+            from app.config.config import settings
+
+            net_status = settings.NETWORK_ERROR_STATUS_CODE
+        except Exception:
+            net_status = 424
         return (
-            503,
+            net_status,
             f"cannot reach upstream Gemini API ({type(e).__name__}: {e}). "
             "Please check network connectivity",
         )

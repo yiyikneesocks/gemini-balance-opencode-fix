@@ -87,6 +87,10 @@ class KeyModelState(Base):
     kind = Column(String(10), nullable=True, comment="最近错误类型：rpd/rpm")
     cooldown_until = Column(DateTime, nullable=True, comment="冷却截止时间（本地时间）")
     last_error_time = Column(DateTime, nullable=True, comment="最近一次出错时间")
+    last_error_log = Column(Text, nullable=True, comment="最近一次错误详情（用于前端弹窗）")
+    error_count = Column(Integer, nullable=True, default=0, comment="今日出错次数")
+    success_count = Column(Integer, nullable=True, default=0, comment="今日成功调用次数（太平洋日）")
+    stat_day = Column(String(10), nullable=True, comment="统计所属太平洋日 YYYY-MM-DD")
     consecutive_failures = Column(Integer, nullable=True, default=0, comment="连续失败次数")
     error_code = Column(Integer, nullable=True, comment="最近错误状态码")
     updated_at = Column(

@@ -1,0 +1,74 @@
+# Changelog — fork additions
+
+All changes below are local patches on top of
+[snailyp/gemini-balance](https://github.com/snailyp/gemini-balance).
+Upstream code is otherwise unchanged.
+
+## 2026-09-27
+
+### Robust upstream error handling
+
+- **Error classification** (`app/core/error_classifier.py`): classify upstream
+  failures into `network` / `client` / `auth` / `rate_limit_rpd` /
+  `rate_limit_rpm` / `overload` / `unknown`, each with its own retry strategy.
+- **Quota parsing** (`app/core/quota_parser.py`): read the upstream 429 body for
+  `quotaId` (per-day RPD vs per-minute RPM), `quotaDimensions.model`, and
+  `RetryInfo.retryDelay`.
+- **Per-`(key, model)` cooldown** (`app/service/key/key_manager.py`): RPM
+  cooldowns use the upstream `retryDelay`; RPD cools until Pacific midnight;
+  a longer cooldown is never shortened by a shorter one. A model hitting its
+  quota does not affect other models on the same key.
+- **Unified retry loop** (`app/service/chat/gemini_chat_service.py`): a single
+  loop for stream and non-stream. The route-level `RetryHandler` is removed from
+  the chat endpoints (previously up to 3×3 = 9 upstream calls per request).
+  - `network`: retry the **same** key with backoff (1s/2s/4s), then fail; the key
+    is never penalized.
+  - `client` (400): fail fast; switching keys cannot help.
+  - `auth` (bad key / 401 / 403): penalize and switch immediately.
+  - `rate_limit_rpm` / `overload`: cooldown `(key, model)` and switch.
+  - `rate_limit_rpd`: long cooldown; if every key is exhausted for a model,
+    return immediately with a "switch model" hint.
+- **429 / 503 / network errors no longer count toward the permanent failure
+  counter** — only `auth` / `unknown` do. Keys are no longer misjudged as invalid.
+- **Network errors are explicit** (`UpstreamNetworkError`). The returned status
+  code is configurable via `NETWORK_ERROR_STATUS_CODE` (default **424**), which is
+  outside the AI SDK retry set (408/409/429/≥500), so opencode stops retrying
+  immediately instead of spinning.
+- **Log write fix**: normalize empty/invalid `status_code` before writing request
+  / error logs (fixes MySQL error 1366).
+
+### Persistence
+
+- New table **`t_key_model_state`** storing per-`(key, model)` cooldown and daily
+  statistics; the key is stored as a SHA256 hash, never plaintext.
+- State is restored on startup (cooldowns and today's statistics survive restarts);
+  an hourly job cleans stale rows.
+- Lightweight auto-migration adds new columns to the existing table idempotently.
+
+### Dashboard
+
+- New **`/model-cooldown`** page and `/api/keys/model-cooldown` endpoint.
+- Shows today's `(key, model)` pairs that hit 429/503: masked key, status badge
+  (`RPD 日耗尽` / `冷却中` / `可用`), last error type, remaining cooldown, last
+  error time, **today's success / error counts**, with per-model collapsible cards
+  and an overall model status (`RPD全部耗尽` / `全部冷却中` / `部分冷却` / `可用`).
+- Clicking the error-type badge opens the full upstream error body.
+- Navigation button added to the config / dashboard / logs pages.
+
+### Load balancing
+
+- `BALANCE_BY_SUCCESS_COUNT` (default on): pick the available key with the fewest
+  successful calls today, skipping the key picked last (avoids bursting a single
+  key into its RPM limit). Rate-limit cooldown remains the hard backstop.
+
+### Also included
+
+- Fix intermittent `400 Requests ending with a model turn are not supported`
+  (`_ensure_valid_ending_turn`, see `DIAGNOSIS-turn-400.md`).
+- Pin `starlette<1.0` (`constraints.txt`) — Starlette ≥ 1.0 broke the web UI.
+- Font Awesome CDN switched to jsDelivr.
+- systemd unit template under `deploy/`.
+
+## Earlier
+
+- `fix(gemini): append trailing user turn to avoid model-turn 400`.

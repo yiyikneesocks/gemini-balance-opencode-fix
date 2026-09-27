@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     # 按天配额（RPD）耗尽的长冷却
     RPD_COOLDOWN_HOURS: float = 24.0  # 日耗尽后的禁用时长（小时）
     RPD_MIN_THRESHOLD_S: float = 300.0  # 剩余冷却超过此值视为"长冷却/RPD"（5 分钟）
+    RPD_PROBE_ATTEMPTS: int = 2  # 即使全池 RPD 耗尽，也额外探测重试的轮数（配额可能已重置）
+    # 负载均衡：优先选择"今日成功次数最少"的可用 key，避免个别 key 被反复刷爆 TPM
+    BALANCE_BY_SUCCESS_COUNT: bool = True
+    # 网络不可达时返回给客户端的 HTTP 状态码。
+    # AI SDK / opencode 仅对 408/409/429/5xx 判定为可重试；默认 424（Failed Dependency）
+    # 属于"不可重试"，可让 opencode 立刻停止重试、直接报错，避免全池空转刷屏。
+    NETWORK_ERROR_STATUS_CODE: int = 424
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []

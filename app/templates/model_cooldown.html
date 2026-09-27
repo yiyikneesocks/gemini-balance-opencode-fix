@@ -94,6 +94,12 @@ content %}
     if (kind === "rpd") {
       return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700">RPD 日耗尽</span>';
     }
+    if (kind === "network") {
+      return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-100 text-purple-700">网络错误</span>';
+    }
+    if (kind === "client") {
+      return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-200 text-gray-700">请求错误</span>';
+    }
     return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-yellow-100 text-yellow-700">RPM 限流</span>';
   }
 
@@ -135,6 +141,43 @@ content %}
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
+  // 缓存最近一次数据，供弹窗按 (key, model) 查找完整错误信息
+  let latestModels = [];
+
+  // 点击"最近错误类型"标签 -> 弹出完整错误详情（与错误日志页"详情"一致）
+  function showErrDetail(maskedKey, model) {
+    const m = latestModels.find((x) => x.model === model);
+    const k = m && (m.keys || []).find((x) => x.key === maskedKey);
+    const modal = document.getElementById("errDetailModal");
+    document.getElementById("errDetailKey").textContent = maskedKey || "-";
+    document.getElementById("errDetailModel").textContent = model || "-";
+    document.getElementById("errDetailType").textContent = k
+      ? (k.kind === "rpd"
+          ? "RPD 日配额耗尽"
+          : k.kind === "network"
+          ? "网络不可达"
+          : k.kind === "client"
+          ? "请求错误（4xx）"
+          : "RPM 瞬时限流 / 503")
+      : "-";
+    document.getElementById("errDetailCode").textContent =
+      k && k.last_error_code != null ? k.last_error_code : "-";
+    document.getElementById("errDetailTime").textContent =
+      (k && k.last_error_time) || "-";
+    document.getElementById("errDetailCount").textContent = k
+      ? `今日成功 ${k.success_count ?? 0} 次 / 今日出错 ${k.error_count ?? 0} 次`
+      : "-";
+    document.getElementById("errDetailLog").textContent =
+      (k && k.last_error_log) || "无（该 key 该模型暂无可展示的完整错误内容）";
+    modal.classList.add("show");
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeErrDetail() {
+    document.getElementById("errDetailModal").classList.remove("show");
+    document.body.style.overflow = "";
+  }
+
   async function loadCooldown() {
     const container = document.getElementById("cooldown-container");
     try {
@@ -163,6 +206,7 @@ content %}
         return;
       }
       let html = "";
+      latestModels = data.models || [];
       for (const m of data.models) {
         const rows = (m.keys || [])
           .map((k) => {
@@ -171,11 +215,14 @@ content %}
           <tr>
             <td class="px-3 py-2 font-mono text-xs">${esc(k.key)}</td>
             <td class="px-3 py-2">${now.badge}</td>
-            <td class="px-3 py-2">${kindBadge(k.kind)}</td>
+            <td class="px-3 py-2 cursor-pointer hover:opacity-70" title="点击查看完整错误信息"
+                onclick="showErrDetail('${esc(k.key)}', '${esc(m.model)}')">${kindBadge(k.kind)}</td>
             <td class="px-3 py-2 text-right font-mono text-sm">${
               k.remaining_s > 0 ? formatRemaining(k.remaining_s) : '<span class="text-green-600">已恢复</span>'
             }</td>
             <td class="px-3 py-2 text-right text-xs text-gray-400">${esc(k.last_error_time || "")}</td>
+            <td class="px-3 py-2 text-right font-mono text-sm text-blue-600">${k.success_count ?? 0}</td>
+            <td class="px-3 py-2 text-right font-mono text-xs text-gray-400">${k.error_count ?? 0}</td>
           </tr>`;
           })
           .join("");
@@ -214,6 +261,8 @@ content %}
                   <th class="px-3 py-1.5">最近错误类型</th>
                   <th class="px-3 py-1.5 text-right">剩余冷却</th>
                   <th class="px-3 py-1.5 text-right">最近错误时间</th>
+                  <th class="px-3 py-1.5 text-right">今日成功</th>
+                  <th class="px-3 py-1.5 text-right">今日出错</th>
                 </tr>
               </thead>
               <tbody>${rows}</tbody>
@@ -234,4 +283,63 @@ content %}
   document.addEventListener("DOMContentLoaded", loadCooldown);
   setInterval(loadCooldown, 30000);
 </script>
+
+<!-- 错误详情弹窗 -->
+<div id="errDetailModal" class="modal">
+  <div
+    class="w-full max-w-3xl mx-auto rounded-2xl shadow-2xl overflow-hidden"
+    style="background-color: #ffffff; color: #374151; border: 1px solid #e5e7eb"
+  >
+    <div class="p-6">
+      <div
+        class="flex justify-between items-center pb-4 mb-4"
+        style="border-bottom: 1px solid #e5e7eb"
+      >
+        <h2 class="text-xl font-bold text-gray-800">错误详情</h2>
+        <button
+          class="text-gray-600 hover:text-gray-800 text-xl"
+          onclick="closeErrDetail()"
+        >
+          &times;
+        </button>
+      </div>
+      <div class="space-y-3 max-h-[65vh] overflow-y-auto">
+        <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+          <div class="text-sm font-semibold text-blue-600 mb-1">密钥:</div>
+          <div id="errDetailKey" class="font-mono text-sm text-gray-700"></div>
+        </div>
+        <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+          <div class="text-sm font-semibold text-blue-600 mb-1">模型:</div>
+          <div id="errDetailModel" class="text-sm text-gray-700"></div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+            <div class="text-sm font-semibold text-blue-600 mb-1">错误类型:</div>
+            <div id="errDetailType" class="text-sm text-red-600 font-medium"></div>
+          </div>
+          <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+            <div class="text-sm font-semibold text-blue-600 mb-1">状态码:</div>
+            <div id="errDetailCode" class="text-sm text-gray-700 font-mono"></div>
+          </div>
+          <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+            <div class="text-sm font-semibold text-blue-600 mb-1">最近错误时间:</div>
+            <div id="errDetailTime" class="text-sm text-gray-700"></div>
+          </div>
+        </div>
+        <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+          <div class="text-sm font-semibold text-blue-600 mb-1">统计:</div>
+          <div id="errDetailCount" class="text-sm text-gray-700"></div>
+        </div>
+        <div class="p-3 rounded-lg" style="background-color: #f8fafc">
+          <div class="text-sm font-semibold text-blue-600 mb-1">完整错误信息:</div>
+          <pre
+            id="errDetailLog"
+            class="font-mono text-xs p-3 rounded overflow-x-auto whitespace-pre-wrap"
+            style="background-color: #f1f5f9; color: #374151"
+          ></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}

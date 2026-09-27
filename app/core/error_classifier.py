@@ -128,7 +128,12 @@ def classify_and_extract(e: Exception) -> Tuple[ErrorCategory, int, str]:
 
     # extract_error_info 对 2 参数异常会给出真实状态码；其余按类别给默认
     if category == ErrorCategory.NETWORK:
-        status_code = 503
+        try:
+            from app.config.config import settings
+
+            status_code = settings.NETWORK_ERROR_STATUS_CODE
+        except Exception:
+            status_code = 424
     elif category == ErrorCategory.CLIENT:
         status_code = status_code if (isinstance(status_code, int) and 400 <= status_code < 500) else 400
     elif category == ErrorCategory.AUTH:

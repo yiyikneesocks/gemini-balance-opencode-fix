@@ -77,12 +77,26 @@ class ServiceUnavailableError(APIError):
 
 
 class UpstreamNetworkError(APIError):
-    """上游 Gemini API 网络不可达错误"""
+    """上游 Gemini API 网络不可达错误。
+
+    默认返回 NETWORK_ERROR_STATUS_CODE（默认 424）——AI SDK / opencode 只把
+    408/409/429/5xx 视为可重试，424 属于"不可重试"，据此让 opencode 立刻停止
+    重试、直接报错，避免网络真断时全池空转、日志刷屏。
+    """
 
     def __init__(self, detail: str):
+        try:
+            from app.config.config import settings
+
+            status = settings.NETWORK_ERROR_STATUS_CODE
+        except Exception:
+            status = 424
         super().__init__(
-            status_code=503,
-            detail=f"Network error: {detail}. Please check network connectivity.",
+            status_code=status,
+            detail=(
+                f"Network error: {detail}. Upstream Gemini API is unreachable. "
+                f"Please check network connectivity. Not retryable."
+            ),
             error_code="network_error",
         )
 
@@ -123,7 +137,17 @@ class AllKeysCoolingError(APIError):
             detail += (
                 f" Models with available quota: {', '.join(self.model_hints)}."
             )
-        super().__init__(status_code=429, detail=detail, error_code="all_keys_cooling")
+        # RPD 日耗尽：重试无意义 → 返回不可重试状态码（默认 424），让 opencode
+        # 立即停止重试并提示换模型；普通瞬时限流仍用 429（可重试）。
+        status = 429
+        if rpd_exhausted:
+            try:
+                from app.config.config import settings
+
+                status = settings.NETWORK_ERROR_STATUS_CODE
+            except Exception:
+                status = 424
+        super().__init__(status_code=status, detail=detail, error_code="all_keys_cooling")
 
 
 def setup_exception_handlers(app: FastAPI) -> None:

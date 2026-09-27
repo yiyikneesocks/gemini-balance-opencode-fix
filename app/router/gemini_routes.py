@@ -55,22 +55,36 @@ async def get_next_working_key(
     key = await key_manager.get_next_working_key(model)
     if key:
         return key
-    # 所有 key 都在冷却：等最早到期的 key（封顶 ALL_COOLING_MAX_WAIT_S）再取一次
-    wait_s = await key_manager.earliest_cooldown_release(model)
-    if wait_s:
-        wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
-        logger.info(
-            f"All keys cooling down for model={model or '_'}; waiting "
-            f"{wait_s:.1f}s for earliest release"
-        )
-        await asyncio.sleep(wait_s)
-        key = await key_manager.get_next_working_key(model)
+    # 仅当每把 key 都是 RPD 日耗尽时，等待无意义（直接换模型建议）
+    all_rpd = key_manager.all_keys_rpd_exhausted(model)
+    if not all_rpd:
+        # 部分/全部为短冷却：等最早到期的 key（封顶 ALL_COOLING_MAX_WAIT_S）再取一次
+        wait_s = await key_manager.earliest_cooldown_release(model)
+        if wait_s:
+            wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
+            logger.info(
+                f"All keys cooling down for model={model or '_'} "
+                f"(not all RPD-exhausted); waiting {wait_s:.1f}s "
+                f"for earliest release"
+            )
+            await asyncio.sleep(wait_s)
+            key = await key_manager.get_next_working_key(model)
     if not key:
         # 仍无可用 key：返回 429 语义 + 建议换模型（客户端侧自行退避重试）
         hints = key_manager.get_available_models_hint(exclude_model=model)
-        detail = "All API keys are cooling down or invalid. Try again later."
+        if all_rpd:
+            detail = (
+                f"Daily quota (RPD) for model '{model or 'requested model'}' is "
+                f"exhausted on all API keys. Retrying will NOT help until quota "
+                f"resets. Please switch to another model."
+            )
+        else:
+            detail = (
+                "All API keys are rate-limited or cooling down. "
+                "Please retry later."
+            )
         if hints:
-            detail += f" Or switch to a model with available quota, e.g. {', '.join(hints)}."
+            detail += f" Models with available quota: {', '.join(hints)}."
         raise HTTPException(status_code=429, detail=detail)
     return key
 

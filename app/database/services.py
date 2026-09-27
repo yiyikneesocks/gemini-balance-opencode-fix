@@ -848,6 +848,9 @@ async def upsert_key_model_state(
     last_error_time: Optional[datetime] = None,
     consecutive_failures: Optional[int] = None,
     error_code: Optional[int] = None,
+    last_error_log: Optional[str] = None,
+    error_count: Optional[int] = None,
+    stat_day: Optional[str] = None,
 ) -> bool:
     """写入/更新 (key, model) 限流状态。"""
     try:
@@ -870,6 +873,15 @@ async def upsert_key_model_state(
                 values["consecutive_failures"] = consecutive_failures
             if error_code is not None:
                 values["error_code"] = error_code
+            if last_error_log is not None:
+                values["last_error_log"] = last_error_log
+            if error_count is not None:
+                values["error_count"] = error_count
+            if stat_day is not None:
+                # 跨太平洋日时重置成功计数
+                if existing["stat_day"] != stat_day:
+                    values["stat_day"] = stat_day
+                    values["success_count"] = 0
             await database.execute(
                 update(KeyModelState)
                 .where(KeyModelState.id == existing["id"])
@@ -886,11 +898,71 @@ async def upsert_key_model_state(
                     last_error_time=last_error_time,
                     consecutive_failures=consecutive_failures or 0,
                     error_code=error_code,
+                    last_error_log=last_error_log,
+                    error_count=error_count or 0,
+                    success_count=0,
+                    stat_day=stat_day,
                 )
             )
         return True
     except Exception as e:
         logger.error(f"Failed to upsert key model state: {str(e)}")
+        return False
+
+
+async def clear_key_model_cooldown(api_key: str, model_name: str) -> bool:
+    """清除 (key, model) 的冷却（成功恢复时调用），保留今日统计计数。"""
+    try:
+        await database.execute(
+            update(KeyModelState)
+            .where(
+                (KeyModelState.key_hash == _key_hash(api_key))
+                & (KeyModelState.model_name == model_name)
+            )
+            .values(cooldown_until=None, kind=None, consecutive_failures=0)
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to clear key model cooldown: {str(e)}")
+        return False
+
+
+async def increment_key_model_success(
+    api_key: str, model_name: str, stat_day: str
+) -> bool:
+    """累加 (key, model) 在指定太平洋日的成功调用次数（不存在则创建）。"""
+    try:
+        key_hash = _key_hash(api_key)
+        query = select(KeyModelState).where(
+            (KeyModelState.key_hash == key_hash)
+            & (KeyModelState.model_name == model_name)
+        )
+        existing = await database.fetch_one(query)
+        if existing:
+            same_day = existing["stat_day"] == stat_day
+            await database.execute(
+                update(KeyModelState)
+                .where(KeyModelState.id == existing["id"])
+                .values(
+                    success_count=(existing["success_count"] or 0) + 1
+                    if same_day
+                    else 1,
+                    stat_day=stat_day,
+                )
+            )
+        else:
+            await database.execute(
+                insert(KeyModelState).values(
+                    key_hash=key_hash,
+                    key_masked=redact_key_for_logging(api_key),
+                    model_name=model_name,
+                    success_count=1,
+                    stat_day=stat_day,
+                )
+            )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to increment key model success: {str(e)}")
         return False
 
 
