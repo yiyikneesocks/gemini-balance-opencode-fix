@@ -19,10 +19,75 @@
 > I have never sold this service on any platform. If you encounter someone selling this service, they are a reseller. Please do not be deceived.
 
 > 🔧 **This is a fork.** Upstream: **snailyp/gemini-balance** (https://github.com/snailyp/gemini-balance).
-> This fork adds a set of fixes for running the proxy with **opencode**: upstream
-> error classification with per-`(key, model)` cooldowns, daily-quota (RPD) handling,
-> MySQL persistence of cooldown/statistics, and a `/model-cooldown` dashboard.
 > See [FORK_NOTES.md](./FORK_NOTES.md) and [CHANGELOG.md](./CHANGELOG.md).
+>
+> **[中文说明见下方 / Chinese notes below](#-fork-additions-中文说明)**
+
+---
+
+## 🔧 Fork additions (中文说明)
+
+This fork focuses on making the proxy **robust and pleasant to use with opencode**
+(and any client on the native Gemini API). Upstream is unchanged except for the
+patches below.
+
+### 1. Smarter upstream error handling
+
+Upstream treated **every** non-200 response identically: rotate the key, retry,
+and increment a permanent failure counter. Under real traffic that blacks out the
+whole key pool during network outages and misjudges rate-limited keys as invalid.
+
+We now classify each error and react differently:
+
+| Upstream result | Key handling | Retry behaviour |
+|-----------------|--------------|-----------------|
+| Network unreachable | **not penalised** | same key, backoff 1s→2s→4s, then fail |
+| 400 (bad payload) | not counted | fail fast (switching keys cannot help) |
+| 400 bad key / 401 / 403 | penalised hard | switch key immediately |
+| 429 per-minute / 503 | per-`(key, model)` cooldown | switch key; cooldown uses Google's own `retryDelay` |
+| 429 per-day (RPD) | long cooldown until **Pacific midnight** | switch key; all keys exhausted → suggest another model |
+
+- **429 / 503 / network errors never count toward the permanent failure counter** —
+  only auth and unknown errors do. Keys are no longer misread as "invalid".
+- A model hitting its quota **does not affect other models on the same key**
+  (cooldowns are per `(key, model)`).
+
+### 2. Clear, non-retryable errors
+
+The AI SDK (used by opencode) only retries `408 / 409 / 429 / ≥500`. Network
+failures now return **424** (configurable via `NETWORK_ERROR_STATUS_CODE`) so the
+client **stops retrying immediately** instead of spinning, and reports a clear
+`Network error … check network connectivity` message. Transient rate limits stay
+`429` and remain retryable.
+
+### 3. Load balancing by daily usage
+
+Requests go to the available key with the **fewest successful calls today**,
+skipping the key used last — so a single key is never burst into its RPM limit.
+The rate-limit cooldown remains the hard backstop.
+
+### 4. Persistence (survives restarts)
+
+New table **`t_key_model_state`** stores per-`(key, model)` cooldown and daily
+statistics; keys are stored as SHA256 (**no plaintext**). State is restored on
+startup and stale rows are cleaned hourly. New columns are added by a lightweight
+auto-migration.
+
+### 5. `/model-cooldown` dashboard
+
+A new page (with a navigation button) shows today's `(key, model)` pairs that hit
+429/503: masked key, status badge (`RPD exhausted` / `Cooling` / `Available`),
+last error type, remaining cooldown, last error time, and **today's success /
+error counts**. Click an error-type badge to see the full upstream error body.
+
+### 6. Also fixed
+
+- Intermittent `400 Requests ending with a model turn are not supported`
+  (`_ensure_valid_ending_turn`).
+- Pin `starlette<1.0` (`constraints.txt`) — Starlette ≥ 1.0 broke the web UI.
+- Font Awesome CDN switched to jsDelivr.
+
+> Full details: [CHANGELOG.md](./CHANGELOG.md) and [FORK_NOTES.md](./FORK_NOTES.md).
 
 ---
 

@@ -16,6 +16,66 @@
 > ⚠️ **重要声明**: 本项目采用 [CC BY-NC 4.0](LICENSE) 协议，**禁止任何形式的商业倒卖服务**。
 > 本人从未在任何平台售卖服务，如遇售卖，均为倒卖行为，请勿上当受骗。
 
+> 🔧 **本仓库是 fork。** 上游：**snailyp/gemini-balance**（https://github.com/snailyp/gemini-balance）。
+> 详见 [FORK_NOTES.md](./FORK_NOTES.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
+>
+> **[English notes above / 英文说明见上方](#-fork-additions-中文说明)**
+
+---
+
+## 🔧 本 Fork 的改进（中文说明）
+
+本 fork 专注于让代理在 **opencode**（以及任何走 Gemini 原生 API 的客户端）下**更健壮、更好用**。
+除以下补丁外，上游代码保持不变。
+
+### 1. 更聪明的上游错误处理
+
+上游把**所有**非 200 响应一视同仁：换 key、重试、并给 key 记永久失败数。真实流量下，
+这会在网络故障时把整个 key 池拉黑，并把被限流的 key 误判为"无效"。
+
+我们现在对错误分类、区别处置：
+
+| 上游返回 | key 处置 | 重试行为 |
+|---------|---------|---------|
+| 网络不可达 | **不惩罚** | **同一 key** 退避 1s→2s→4s，仍失败则报错 |
+| 400（请求体问题）| 不计数 | 立即失败（换 key 也没用）|
+| 400 无效 key / 401 / 403 | 快速拉黑 | 立即换 key |
+| 429 按分钟 / 503 | 按 `(key, model)` 冷却 | 换 key；冷却时长用上游给的 `retryDelay` |
+| 429 按天（RPD）| 长冷却至**太平洋午夜** | 换 key；全部 key 都耗尽 → 提示换模型 |
+
+- **429 / 503 / 网络错误永不进入永久失败计数**——只有 auth 与未知错误才计数，key 不再被误判为"无效"。
+- 某个模型触顶**不影响同一 key 的其他模型**（冷却按 `(key, model)` 隔离）。
+
+### 2. 明确且"不可重试"的报错
+
+AI SDK（opencode 使用）只对 `408 / 409 / 429 / ≥500` 重试。网络故障现在返回 **424**
+（可用 `NETWORK_ERROR_STATUS_CODE` 配置），让客户端**立即停止重试**而非空转，并给出明确的
+`Network error … check network connectivity` 提示；瞬时限流仍是 `429`（可重试）。
+
+### 3. 按当日用量负载均衡
+
+请求优先发往**今日成功次数最少**的可用 key，并跳过上一次刚用过的 key——避免单把 key
+被连续刷爆触发 RPM。限流冷却仍是硬兜底。
+
+### 4. 持久化（重启不丢）
+
+新增表 **`t_key_model_state`** 保存每 `(key, model)` 的冷却与当日统计；key 以 SHA256 存储
+（**不落明文**）。启动时恢复，每小时清理过期行；新增列通过轻量自动迁移补齐。
+
+### 5. `/model-cooldown` 监控页
+
+新增页面（带导航按钮），展示今日触发 429/503 的 `(key, model)`：脱敏 key、现状徽章
+（`RPD日耗尽` / `冷却中` / `可用`）、最近错误类型、剩余冷却、最近错误时间，以及
+**今日成功 / 出错次数**。点击错误类型标签可查看上游完整错误原文。
+
+### 6. 其他修复
+
+- 偶发 `400 Requests ending with a model turn are not supported`（`_ensure_valid_ending_turn`）。
+- 依赖 pin `starlette<1.0`（`constraints.txt`）——Starlette ≥ 1.0 会导致 Web UI 500。
+- Font Awesome CDN 切换到 jsDelivr。
+
+> 完整细节见 [CHANGELOG.md](./CHANGELOG.md) 与 [FORK_NOTES.md](./FORK_NOTES.md)。
+
 ---
 
 ## 📖 项目简介
