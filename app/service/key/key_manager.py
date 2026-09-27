@@ -129,7 +129,10 @@ class KeyManager:
                 # 已有更长的冷却（含 RPD 日耗尽）时不得被短冷却覆盖/缩短
                 existing = self.key_model_cooldown_until.get(km_id, 0.0)
                 if seconds is not None and seconds > 0:
-                    cooldown = min(seconds, settings.COOLDOWN_MAX_S * 4)
+                    # 上游给的 retryDelay 是权威值，尽量遵从；仅设一个宽松上限
+                    # （RPD_COOLDOWN_HOURS）防止异常的超大值把 key 长期锁死。
+                    max_by_upstream = settings.RPD_COOLDOWN_HOURS * 3600.0
+                    cooldown = min(seconds, max_by_upstream)
                 else:
                     cooldown = self._cooldown_seconds(km_id)
                 new_until = time.monotonic() + cooldown

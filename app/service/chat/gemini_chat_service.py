@@ -460,24 +460,27 @@ class GeminiChatService:
                     ErrorCategory.OVERLOAD,
                 ):
                     # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
-                    # 优先用上游给的 retryDelay；RPD（日耗尽）用长冷却。
+                    # 上游给了 retryDelay 就以它为准；仅在无 retryDelay 时，RPD 才用长冷却。
                     from app.core.quota_parser import parse_quota_error
 
                     body = e.args[1] if len(e.args) >= 2 else message
                     quota = parse_quota_error(body if isinstance(body, str) else None)
-                    if category == ErrorCategory.RATE_LIMIT_RPD:
-                        await self.key_manager.mark_key_cooldown(
-                            current_key,
-                            model,
-                            kind="rpd",
-                            error_log=message,
-                            error_code=status_code,
-                        )
-                    elif quota and quota.retry_delay_s:
+                    if quota and quota.retry_delay_s:
+                        # 上游给了确切重试时间就以它为准（免费层的 PerDay 实为滚动额度，
+                        # 上游常说 "retry in 12s"，此时按 RPD 冷却到午夜会过度惩罚）。
                         await self.key_manager.mark_key_cooldown(
                             current_key,
                             model,
                             seconds=quota.retry_delay_s,
+                            error_log=message,
+                            error_code=status_code,
+                        )
+                    elif category == ErrorCategory.RATE_LIMIT_RPD:
+                        # 无 retryDelay 的 RPD：真正的日额度耗尽，长冷却到太平洋午夜
+                        await self.key_manager.mark_key_cooldown(
+                            current_key,
+                            model,
+                            kind="rpd",
                             error_log=message,
                             error_code=status_code,
                         )
@@ -808,24 +811,27 @@ class GeminiChatService:
                     ErrorCategory.OVERLOAD,
                 ):
                     # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
-                    # 优先用上游给的 retryDelay；RPD（日耗尽）用长冷却。
+                    # 上游给了 retryDelay 就以它为准；仅在无 retryDelay 时，RPD 才用长冷却。
                     from app.core.quota_parser import parse_quota_error
 
                     body = e.args[1] if len(e.args) >= 2 else error_log_msg
                     quota = parse_quota_error(body if isinstance(body, str) else None)
-                    if category == ErrorCategory.RATE_LIMIT_RPD:
-                        await self.key_manager.mark_key_cooldown(
-                            current_key,
-                            model,
-                            kind="rpd",
-                            error_log=error_log_msg,
-                            error_code=status_code,
-                        )
-                    elif quota and quota.retry_delay_s:
+                    if quota and quota.retry_delay_s:
+                        # 上游给了确切重试时间就以它为准（免费层的 PerDay 实为滚动额度，
+                        # 上游常说 "retry in 12s"，此时按 RPD 冷却到午夜会过度惩罚）。
                         await self.key_manager.mark_key_cooldown(
                             current_key,
                             model,
                             seconds=quota.retry_delay_s,
+                            error_log=error_log_msg,
+                            error_code=status_code,
+                        )
+                    elif category == ErrorCategory.RATE_LIMIT_RPD:
+                        # 无 retryDelay 的 RPD：真正的日额度耗尽，长冷却到太平洋午夜
+                        await self.key_manager.mark_key_cooldown(
+                            current_key,
+                            model,
+                            kind="rpd",
                             error_log=error_log_msg,
                             error_code=status_code,
                         )
