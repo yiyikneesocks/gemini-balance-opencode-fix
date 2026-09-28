@@ -101,6 +101,30 @@ class UpstreamNetworkError(APIError):
         )
 
 
+class UpstreamOverloadError(APIError):
+    """上游模型持续过载（503 high demand），换 key 无效，应换模型。
+
+    返回不可重试状态码，让客户端立即停止重试并改用其他模型。
+    """
+
+    def __init__(self, model: str = "", model_hints=None):
+        self.model_hints = list(model_hints or [])
+        try:
+            from app.config.config import settings
+
+            status = settings.NETWORK_ERROR_STATUS_CODE
+        except Exception:
+            status = 424
+        detail = (
+            f"Upstream model '{model or 'requested model'}' is overloaded "
+            f"(503 high demand) across all API keys. Switching keys does NOT help. "
+            f"Please switch to another model."
+        )
+        if self.model_hints:
+            detail += f" Models that may be available: {', '.join(self.model_hints)}."
+        super().__init__(status_code=status, detail=detail, error_code="upstream_overload")
+
+
 class AllKeysCoolingError(APIError):
     """指定模型的所有 key 都在冷却中（429/503 累积）。
 

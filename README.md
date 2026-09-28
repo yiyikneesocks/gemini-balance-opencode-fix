@@ -46,11 +46,15 @@ We now classify each error and react differently:
 | 400 bad key / 401 / 403 | penalised hard | switch key immediately |
 | 429 per-minute / 503 | per-`(key, model)` cooldown | switch key; cooldown uses Google's own `retryDelay` |
 | 429 per-day (RPD) | long cooldown until **Pacific midnight** | switch key; all keys exhausted → suggest another model |
+| 503 high demand (overload) | **model-level** counter (switching keys cannot help) | after N consecutive overloads → non-retryable error advising a **model switch** |
 
 - **429 / 503 / network errors never count toward the permanent failure counter** —
   only auth and unknown errors do. Keys are no longer misread as "invalid".
 - A model hitting its quota **does not affect other models on the same key**
   (cooldowns are per `(key, model)`).
+- **503 high demand is treated as upstream overload, not a rate limit.** Since it is
+  model-wide, switching keys does not help; after a few consecutive overloads the
+  proxy returns a non-retryable error telling the client to **switch model**.
 
 ### 2. Clear, non-retryable errors
 

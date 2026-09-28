@@ -47,6 +47,11 @@ class KeyManager:
         self._key_last_picked_seq: Dict[str, int] = {}
         # 每个模型上一次选中的 key（避免连续命中同一把，规避单 key RPM 突发）
         self._last_picked_key: Dict[str, str] = {}
+        # 模型级过载（503 high demand）计数：model -> 连续过载次数
+        # 过载是模型全局现象，换 key 无效，因此单独统计并在达到阈值时中断。
+        self.model_overload_counts: Dict[str, int] = {}
+        # 模型级过载冷却截止时间（monotonic）：model -> until
+        self.model_overload_until: Dict[str, float] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -349,6 +354,62 @@ class KeyManager:
         return self.key_model_success_count.get(
             f"{self._pacific_day_str()}::{self._km_id(key, model)}", 0
         )
+
+    # ---------- 模型级过载（503 high demand） ----------
+
+    def record_model_overload(
+        self, model: str, key: str = "", error_log: str = "", error_code: int = 503
+    ) -> int:
+        """记录一次模型过载，返回该模型当前连续过载次数。
+
+        过载是模型全局问题：同时给该模型设置一个短冷却（避免立即再打），
+        并累计连续过载次数，供上层判断是否直接中断、建议换模型。
+        """
+        import datetime
+
+        model = model or "_"
+        self.model_overload_counts[model] = (
+            self.model_overload_counts.get(model, 0) + 1
+        )
+        self.model_overload_until[model] = (
+            time.monotonic() + settings.OVERLOAD_MODEL_COOLDOWN_S
+        )
+        count = self.model_overload_counts[model]
+        if key:
+            km_id = self._km_id(key, model)
+            self._roll_error_day_if_needed()
+            event = self.key_model_error_today.get(km_id, {})
+            event.update(
+                {
+                    "last_error_time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "last_kind": "overload",
+                    "last_error_log": (error_log or "")[:8000],
+                    "last_error_code": error_code,
+                }
+            )
+            event["error_count"] = event.get("error_count", 0) + 1
+            self.key_model_error_today[km_id] = event
+        logger.info(
+            f"Model {model} overloaded (503 high demand); consecutive count={count}"
+        )
+        return count
+
+    def clear_model_overload(self, model: str) -> None:
+        """请求成功：清零该模型的连续过载计数。"""
+        model = model or "_"
+        self.model_overload_counts[model] = 0
+        self.model_overload_until[model] = 0.0
+
+    def is_model_overloaded_for_giveup(self, model: str) -> bool:
+        """连续过载是否已达"直接中断、建议换模型"的阈值。"""
+        return (
+            self.model_overload_counts.get(model or "_", 0)
+            >= settings.OVERLOAD_KEYS_BEFORE_GIVEUP
+        )
+
+    def _is_model_overload_cooling(self, model: str) -> bool:
+        return time.monotonic() < self.model_overload_until.get(model or "_", 0.0)
+
 
     def pick_rpd_probe_key(self, model: str, exclude: Optional[set] = None) -> Optional[str]:
         """全池 RPD 耗尽时，挑一个最佳"探测"key（其 RPD 冷却剩余最少/最早到期）。

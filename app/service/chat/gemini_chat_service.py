@@ -10,7 +10,7 @@ from typing import Any, AsyncGenerator, Dict, List
 from app.config.config import settings
 from app.core.constants import GEMINI_2_FLASH_EXP_SAFETY_SETTINGS
 from app.core.error_classifier import ErrorCategory, classify_and_extract
-from app.exception.exceptions import AllKeysCoolingError
+from app.exception.exceptions import AllKeysCoolingError, UpstreamOverloadError
 from app.database.services import add_error_log, add_request_log, get_file_api_key
 from app.domain.gemini_models import GeminiRequest
 from app.handler.response_handler import GeminiResponseHandler
@@ -453,13 +453,33 @@ class GeminiChatService:
                     async with self.key_manager.failure_count_lock:
                         if current_key in self.key_manager.key_failure_counts:
                             self.key_manager.key_failure_counts[current_key] += 2
+                elif category == ErrorCategory.OVERLOAD:
+                    # 上游 503 过载（high demand）是"模型全局"问题，换 key 无效：
+                    # 记录模型级过载计数；达到阈值则直接中断，建议换模型。
+                    overload_count = self.key_manager.record_model_overload(
+                        model,
+                        key=current_key,
+                        error_log=message,
+                        error_code=status_code,
+                    )
+                    if self.key_manager.is_model_overloaded_for_giveup(model):
+                        hints = self.key_manager.get_available_models_hint(
+                            exclude_model=model
+                        )
+                        logger.error(
+                            f"Model {model} overloaded {overload_count} times in a "
+                            f"row; returning non-retryable error, suggest switching "
+                            f"model: {hints}"
+                        )
+                        raise UpstreamOverloadError(
+                            model=model, model_hints=hints
+                        ) from e
                 elif category in (
                     ErrorCategory.RATE_LIMIT_RPD,
                     ErrorCategory.RATE_LIMIT_RPM,
                     ErrorCategory.RATE_LIMIT,
-                    ErrorCategory.OVERLOAD,
                 ):
-                    # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
+                    # 瞬时限流：只按 (key, model) 冷却，不进永久失败数。
                     # 上游给了 retryDelay 就以它为准；仅在无 retryDelay 时，RPD 才用长冷却。
                     from app.core.quota_parser import parse_quota_error
 
@@ -595,6 +615,7 @@ class GeminiChatService:
             status_code = 200
             await self.key_manager.mark_key_success(api_key, model)
             await self.key_manager.reset_permanent_failure_count(api_key)
+            self.key_manager.clear_model_overload(model)
             return self.response_handler.handle_response(response, model, stream=False)
         except Exception as e:
             is_success = False
@@ -736,6 +757,7 @@ class GeminiChatService:
                 status_code = 200
                 await self.key_manager.mark_key_success(current_key, model)
                 await self.key_manager.reset_permanent_failure_count(current_key)
+                self.key_manager.clear_model_overload(model)
                 break
             except Exception as e:
                 is_success = False
@@ -804,13 +826,33 @@ class GeminiChatService:
                     async with self.key_manager.failure_count_lock:
                         if current_key in self.key_manager.key_failure_counts:
                             self.key_manager.key_failure_counts[current_key] += 2
+                elif category == ErrorCategory.OVERLOAD:
+                    # 上游 503 过载（high demand）是"模型全局"问题，换 key 无效：
+                    # 记录模型级过载计数；达到阈值则直接中断，建议换模型。
+                    overload_count = self.key_manager.record_model_overload(
+                        model,
+                        key=current_key,
+                        error_log=error_log_msg,
+                        error_code=status_code,
+                    )
+                    if self.key_manager.is_model_overloaded_for_giveup(model):
+                        hints = self.key_manager.get_available_models_hint(
+                            exclude_model=model
+                        )
+                        logger.error(
+                            f"Model {model} overloaded {overload_count} times in a "
+                            f"row; returning non-retryable error, suggest switching "
+                            f"model: {hints}"
+                        )
+                        raise UpstreamOverloadError(
+                            model=model, model_hints=hints
+                        ) from e
                 elif category in (
                     ErrorCategory.RATE_LIMIT_RPD,
                     ErrorCategory.RATE_LIMIT_RPM,
                     ErrorCategory.RATE_LIMIT,
-                    ErrorCategory.OVERLOAD,
                 ):
-                    # 瞬时限流/过载：只按 (key, model) 冷却，不进永久失败数。
+                    # 瞬时限流：只按 (key, model) 冷却，不进永久失败数。
                     # 上游给了 retryDelay 就以它为准；仅在无 retryDelay 时，RPD 才用长冷却。
                     from app.core.quota_parser import parse_quota_error
 

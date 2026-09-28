@@ -97,6 +97,9 @@ content %}
     if (kind === "network") {
       return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-100 text-purple-700">网络错误</span>';
     }
+    if (kind === "overload") {
+      return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-100 text-orange-700">上游过载503</span>';
+    }
     if (kind === "client") {
       return '<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-200 text-gray-700">请求错误</span>';
     }
@@ -156,6 +159,8 @@ content %}
           ? "RPD 日配额耗尽"
           : k.kind === "network"
           ? "网络不可达"
+          : k.kind === "overload"
+          ? "上游模型过载（503 high demand）"
           : k.kind === "client"
           ? "请求错误（4xx）"
           : "RPM 瞬时限流 / 503")

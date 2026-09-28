@@ -6,6 +6,20 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
+### Upstream overload (503 high demand) is no longer treated as a rate limit
+
+- Upstream `503 high demand` ("This model is currently experiencing high demand")
+  is a **model-wide** condition — switching API keys does not help. It used to be
+  handled like an RPM rate limit (per-key cooldown + key switch), which just spun
+  through the whole pool.
+- It is now tracked at the **model level**: consecutive overloads are counted and a
+  short model-wide cooldown is applied. After
+  `OVERLOAD_KEYS_BEFORE_GIVEUP` (default 3) consecutive overloads, the proxy returns
+  a **non-retryable** error (`UpstreamOverloadError`, status
+  `NETWORK_ERROR_STATUS_CODE`, default 424) telling the client to **switch model**,
+  and lists models that may still be available. A successful call clears the counter.
+- New settings: `OVERLOAD_KEYS_BEFORE_GIVEUP`, `OVERLOAD_MODEL_COOLDOWN_S`.
+
 ### Robust upstream error handling
 
 - **Error classification** (`app/core/error_classifier.py`): classify upstream

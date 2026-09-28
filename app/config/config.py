@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # AI SDK / opencode 仅对 408/409/429/5xx 判定为可重试；默认 424（Failed Dependency）
     # 属于"不可重试"，可让 opencode 立刻停止重试、直接报错，避免全池空转刷屏。
     NETWORK_ERROR_STATUS_CODE: int = 424
+    # 上游 503 过载（high demand）：该模型全局过载，换 key 也无效。
+    # 连续遇到这么多把 key 都返回过载后，直接返回"不可重试 + 换模型"错误。
+    OVERLOAD_KEYS_BEFORE_GIVEUP: int = 3
+    # 模型级过载冷却基数（秒）：过载时给该模型所有 key 记一个短冷却，避免立即重试
+    OVERLOAD_MODEL_COOLDOWN_S: float = 5.0
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []
