@@ -10,7 +10,11 @@ from typing import Any, AsyncGenerator, Dict, List
 from app.config.config import settings
 from app.core.constants import GEMINI_2_FLASH_EXP_SAFETY_SETTINGS
 from app.core.error_classifier import ErrorCategory, classify_and_extract
-from app.exception.exceptions import AllKeysCoolingError, UpstreamOverloadError
+from app.exception.exceptions import (
+    AllKeysCoolingError,
+    UpstreamNetworkError,
+    UpstreamOverloadError,
+)
 from app.database.services import add_error_log, add_request_log, get_file_api_key
 from app.domain.gemini_models import GeminiRequest
 from app.handler.response_handler import GeminiResponseHandler
@@ -402,6 +406,11 @@ class GeminiChatService:
         rpd_probe = 0
         self._rpd_probed_keys: set = set()
 
+        # 熔断窗口内：直接返回与"首个触发者"相同的错误，快速失败，不空转
+        active = self.key_manager.get_active_breaker_error(model)
+        if active is not None:
+            raise UpstreamOverloadError(model=model, detail=active)
+
         while True:
             try:
                 return await call(current_key)
@@ -427,7 +436,12 @@ class GeminiChatService:
                             f"Network unreachable after {network_attempt} attempts "
                             f"on same key; giving up (key not penalized)"
                         )
-                        raise
+                        # 网络不可达：触发全局熔断，窗口内所有模型快速失败
+                        err = UpstreamNetworkError(
+                            f"{type(e).__name__}: {message}".strip(": ")
+                        )
+                        self.key_manager.trip_global_breaker(err.detail)
+                        raise err from e
                     backoff = settings.NETWORK_BACKOFF_BASE_S * (
                         2 ** (network_attempt - 1)
                     )
@@ -471,9 +485,9 @@ class GeminiChatService:
                             f"row; returning non-retryable error, suggest switching "
                             f"model: {hints}"
                         )
-                        raise UpstreamOverloadError(
-                            model=model, model_hints=hints
-                        ) from e
+                        err = UpstreamOverloadError(model=model, model_hints=hints)
+                        self.key_manager.trip_model_breaker(model, err.detail)
+                        raise err from e
                 elif category in (
                     ErrorCategory.RATE_LIMIT_RPD,
                     ErrorCategory.RATE_LIMIT_RPM,
@@ -575,9 +589,13 @@ class GeminiChatService:
                         f"All keys RPD-exhausted for model={model or '_'}; "
                         f"suggesting model switch: {hints}"
                     )
-                raise AllKeysCoolingError(
+                err = AllKeysCoolingError(
                     model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
-                ) from e
+                )
+                if rpd_exhausted:
+                    # 全 RPD 耗尽：按模型熔断，窗口内该模型快速失败
+                    self.key_manager.trip_model_breaker(model, err.detail)
+                raise err from e
 
     async def generate_content(
         self, model: str, request: GeminiRequest, api_key: str
@@ -616,6 +634,7 @@ class GeminiChatService:
             await self.key_manager.mark_key_success(api_key, model)
             await self.key_manager.reset_permanent_failure_count(api_key)
             self.key_manager.clear_model_overload(model)
+            self.key_manager.clear_breaker_on_success(model)
             return self.response_handler.handle_response(response, model, stream=False)
         except Exception as e:
             is_success = False
@@ -722,6 +741,11 @@ class GeminiChatService:
         rpd_probe = 0
         self._rpd_probed_keys: set = set()
 
+        # 熔断窗口内：直接返回与"首个触发者"相同的错误，快速失败，不空转
+        active = self.key_manager.get_active_breaker_error(model)
+        if active is not None:
+            raise UpstreamOverloadError(model=model, detail=active)
+
         while True:
             request_datetime = datetime.datetime.now()
             start_time = time.perf_counter()
@@ -758,6 +782,7 @@ class GeminiChatService:
                 await self.key_manager.mark_key_success(current_key, model)
                 await self.key_manager.reset_permanent_failure_count(current_key)
                 self.key_manager.clear_model_overload(model)
+                self.key_manager.clear_breaker_on_success(model)
                 break
             except Exception as e:
                 is_success = False
@@ -790,7 +815,11 @@ class GeminiChatService:
                             f"Network unreachable after {network_attempt} attempts "
                             f"on same key; giving up (key not penalized)"
                         )
-                        raise
+                        err = UpstreamNetworkError(
+                            f"{type(e).__name__}: {message}".strip(": ")
+                        )
+                        self.key_manager.trip_global_breaker(err.detail)
+                        raise err from e
                     backoff = settings.NETWORK_BACKOFF_BASE_S * (
                         2 ** (network_attempt - 1)
                     )
@@ -844,9 +873,9 @@ class GeminiChatService:
                             f"row; returning non-retryable error, suggest switching "
                             f"model: {hints}"
                         )
-                        raise UpstreamOverloadError(
-                            model=model, model_hints=hints
-                        ) from e
+                        err = UpstreamOverloadError(model=model, model_hints=hints)
+                        self.key_manager.trip_model_breaker(model, err.detail)
+                        raise err from e
                 elif category in (
                     ErrorCategory.RATE_LIMIT_RPD,
                     ErrorCategory.RATE_LIMIT_RPM,
@@ -951,9 +980,13 @@ class GeminiChatService:
                         f"All keys RPD-exhausted for model={model or '_'}; "
                         f"suggesting model switch: {hints}"
                     )
-                raise AllKeysCoolingError(
+                err = AllKeysCoolingError(
                     model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
-                ) from e
+                )
+                if rpd_exhausted:
+                    # 全 RPD 耗尽：按模型熔断，窗口内该模型快速失败
+                    self.key_manager.trip_model_breaker(model, err.detail)
+                raise err from e
             finally:
                 end_time = time.perf_counter()
                 latency_ms = int((end_time - start_time) * 1000)

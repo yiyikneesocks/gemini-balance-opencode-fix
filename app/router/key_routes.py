@@ -116,5 +116,6 @@ async def get_model_cooldown(
     return {
         "models": models,
         "total_models": len(models),
+        "breaker": key_manager.get_breaker_state(),
         "all_exhausted_note": "rpd = daily quota exhausted; rpm = temporary rate limit",
     }

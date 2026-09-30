@@ -105,9 +105,10 @@ class UpstreamOverloadError(APIError):
     """上游模型持续过载（503 high demand），换 key 无效，应换模型。
 
     返回不可重试状态码，让客户端立即停止重试并改用其他模型。
+    也用于熔断窗口内复用"首个触发者"的错误文案（detail 显式传入时原样使用）。
     """
 
-    def __init__(self, model: str = "", model_hints=None):
+    def __init__(self, model: str = "", model_hints=None, detail: str = ""):
         self.model_hints = list(model_hints or [])
         try:
             from app.config.config import settings
@@ -115,13 +116,16 @@ class UpstreamOverloadError(APIError):
             status = settings.NETWORK_ERROR_STATUS_CODE
         except Exception:
             status = 424
-        detail = (
-            f"Upstream model '{model or 'requested model'}' is overloaded "
-            f"(503 high demand) across all API keys. Switching keys does NOT help. "
-            f"Please switch to another model."
-        )
-        if self.model_hints:
-            detail += f" Models that may be available: {', '.join(self.model_hints)}."
+        if not detail:
+            detail = (
+                f"Upstream model '{model or 'requested model'}' is overloaded "
+                f"(503 high demand) across all API keys. Switching keys does NOT help. "
+                f"Please switch to another model."
+            )
+            if self.model_hints:
+                detail += (
+                    f" Models that may be available: {', '.join(self.model_hints)}."
+                )
         super().__init__(status_code=status, detail=detail, error_code="upstream_overload")
 
 

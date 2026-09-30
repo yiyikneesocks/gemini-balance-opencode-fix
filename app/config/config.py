@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # 分发：同一把 key 两次被选中之间至少隔开的其他选择次数（避免重复发同一把 key）。
     # 这是最高优先级——先拉开重复间隔，再按"今日成功次数最少"选。
     KEY_REPEAT_GAP: int = 2
+    # 熔断窗口（秒）：一旦返回 424（网络不可达 / 全 RPD 耗尽 / 持续过载），
+    # 在窗口内同类请求直接返回与"首个触发者"相同的 424 错误，避免全池空转。
+    #   - 网络不可达：全局熔断（所有模型）
+    #   - 全 RPD 耗尽 / 持续过载：按模型熔断（仅该模型）
+    BREAKER_WINDOW_S: float = 15.0
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []

@@ -6,6 +6,16 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
+### Circuit breaker for 424 (fast-fail window)
+
+- Once a 424 is returned (network unreachable / all-RPD / sustained overload), a
+  breaker opens for `BREAKER_WINDOW_S` (default 15s). During the window, new
+  requests fail fast with the **same** error text as the first trigger, instead of
+  re-running the retry path.
+- A network outage trips a **global** breaker (all models); all-RPD or sustained
+  overload trips a **per-model** breaker. Any successful call closes the breaker.
+- `/api/keys/model-cooldown` exposes the current `breaker` state.
+
 ### Dispatch: request-agnostic key rotation
 
 - The backend's dispatch is intentionally simple and **request-agnostic**: it only

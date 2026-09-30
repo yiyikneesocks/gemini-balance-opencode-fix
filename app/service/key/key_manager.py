@@ -54,6 +54,13 @@ class KeyManager:
         self.model_overload_counts: Dict[str, int] = {}
         # 模型级过载冷却截止时间（monotonic）：model -> until
         self.model_overload_until: Dict[str, float] = {}
+        # 熔断器：一旦返回 424（网络不可达/全 RPD/持续过载），在窗口内直接快速失败。
+        # global_breaker_until 用于"网络不可达"（影响所有模型）；
+        # model_breaker_until[model] 用于"全 RPD 耗尽/持续过载"（仅该模型）。
+        self.global_breaker_until: float = 0.0
+        self.global_breaker_error: Optional[str] = None
+        self.model_breaker_until: Dict[str, float] = {}
+        self.model_breaker_error: Dict[str, str] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -411,6 +418,73 @@ class KeyManager:
 
     def _is_model_overload_cooling(self, model: str) -> bool:
         return time.monotonic() < self.model_overload_until.get(model or "_", 0.0)
+
+    # ---------- 熔断器（424 快速失败窗口） ----------
+
+    def trip_global_breaker(self, error_message: str) -> None:
+        """触发全局熔断（网络不可达）：窗口内所有模型直接返回同一错误。"""
+        self.global_breaker_until = time.monotonic() + settings.BREAKER_WINDOW_S
+        if not self.global_breaker_error:
+            # 保留"第一个触发者"的错误文案
+            self.global_breaker_error = error_message
+        logger.warning(
+            f"Global circuit breaker tripped for {settings.BREAKER_WINDOW_S:.0f}s "
+            f"(network unreachable): {error_message[:120]}"
+        )
+
+    def trip_model_breaker(self, model: str, error_message: str) -> None:
+        """触发模型熔断（全 RPD 耗尽 / 持续过载）：窗口内该模型直接返回同一错误。"""
+        m = model or "_"
+        self.model_breaker_until[m] = time.monotonic() + settings.BREAKER_WINDOW_S
+        if not self.model_breaker_error.get(m):
+            self.model_breaker_error[m] = error_message
+        logger.warning(
+            f"Model circuit breaker tripped for model={m} "
+            f"{settings.BREAKER_WINDOW_S:.0f}s: {error_message[:120]}"
+        )
+
+    def get_active_breaker_error(self, model: str = "") -> Optional[str]:
+        """若当前处于熔断窗口内，返回"第一个触发者"的错误文案；否则 None。
+
+        优先返回全局熔断（网络不可达，影响所有模型），其次该模型的熔断。
+        """
+        now = time.monotonic()
+        if now < self.global_breaker_until and self.global_breaker_error:
+            return self.global_breaker_error
+        m = model or "_"
+        if now < self.model_breaker_until.get(m, 0.0) and self.model_breaker_error.get(m):
+            return self.model_breaker_error[m]
+        return None
+
+    def is_breaker_open(self, model: str = "") -> bool:
+        return self.get_active_breaker_error(model) is not None
+
+    def get_breaker_state(self) -> Dict[str, Any]:
+        """返回当前熔断状态（监控用）：全局 + 各模型，及其剩余秒数。"""
+        now = time.monotonic()
+        state: Dict[str, Any] = {"global": None, "models": {}}
+        if now < self.global_breaker_until and self.global_breaker_error:
+            state["global"] = {
+                "remaining_s": round(self.global_breaker_until - now, 1),
+                "error": self.global_breaker_error,
+            }
+        for model, until in self.model_breaker_until.items():
+            if now < until and self.model_breaker_error.get(model):
+                state["models"][model] = {
+                    "remaining_s": round(until - now, 1),
+                    "error": self.model_breaker_error[model],
+                }
+        return state
+
+    def clear_breaker_on_success(self, model: str = "") -> None:
+        """任一请求成功：说明链路/该模型已恢复，解除对应熔断。"""
+        if self.global_breaker_error:
+            self.global_breaker_until = 0.0
+            self.global_breaker_error = None
+        m = model or "_"
+        if m in self.model_breaker_error:
+            self.model_breaker_until[m] = 0.0
+            self.model_breaker_error.pop(m, None)
 
 
     def pick_rpd_probe_key(self, model: str, exclude: Optional[set] = None) -> Optional[str]:

@@ -56,13 +56,19 @@ We now classify each error and react differently:
   model-wide, switching keys does not help; after a few consecutive overloads the
   proxy returns a non-retryable error telling the client to **switch model**.
 
-### 2. Clear, non-retryable errors
-
+### 2. Clear, non-retryable errors + circuit breaker
 The AI SDK (used by opencode) only retries `408 / 409 / 429 / ≥500`. Network
 failures now return **424** (configurable via `NETWORK_ERROR_STATUS_CODE`) so the
 client **stops retrying immediately** instead of spinning, and reports a clear
 `Network error … check network connectivity` message. Transient rate limits stay
 `429` and remain retryable.
+
+Once a 424 is returned, a **circuit breaker** opens for `BREAKER_WINDOW_S`
+(default 15s): during the window, requests fail fast with the *same* error (the
+first trigger's message) instead of re-running the whole retry path. A network
+outage trips a **global** breaker (all models); a model whose daily quota is fully
+exhausted, or which is consistently overloaded, trips a **per-model** breaker. Any
+successful call closes the breaker immediately.
 
 ### 3. Load balancing by daily usage
 

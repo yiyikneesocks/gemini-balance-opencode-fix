@@ -52,6 +52,10 @@ async def get_next_working_key(
         model = (body.get("model") or "").split(":")[0]
     except Exception:
         pass
+    # 熔断窗口内：直接返回与"首个触发者"相同的 424，快速失败
+    active = key_manager.get_active_breaker_error(model)
+    if active is not None:
+        raise HTTPException(status_code=settings.NETWORK_ERROR_STATUS_CODE, detail=active)
     key = await key_manager.get_next_working_key(model)
     if key:
         return key
