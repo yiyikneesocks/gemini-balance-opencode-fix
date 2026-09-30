@@ -6,6 +6,17 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
+### Concurrency fairness: no more starvation between simultaneous conversations
+
+- Previously there was no notion of a key being **in use**: two conversations could
+  be handed the same key, and once it cooled, both raced for the same single key —
+  one conversation could be starved for a long time.
+- Added **in-flight tracking per `(key, model)`** (`mark_key_inflight` /
+  `release_key_inflight`). Key selection now prefers the key with the **fewest
+  in-flight requests**, then the fewest successful calls today, then least-recently
+  picked. Concurrent conversations are now spread across distinct keys.
+- New "in-flight" column on the `/model-cooldown` dashboard.
+
 ### Upstream overload (503 high demand) is no longer treated as a rate limit
 
 - Upstream `503 high demand` ("This model is currently experiencing high demand")

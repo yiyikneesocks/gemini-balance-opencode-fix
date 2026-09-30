@@ -52,6 +52,9 @@ class KeyManager:
         self.model_overload_counts: Dict[str, int] = {}
         # 模型级过载冷却截止时间（monotonic）：model -> until
         self.model_overload_until: Dict[str, float] = {}
+        # 在途请求计数："<key>::<model>" -> 正在进行中的请求数。
+        # 用于避免多对话并发时全部挤在同一把 key 上，导致其他对话被饿死。
+        self.key_model_inflight: Dict[str, int] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -355,6 +358,25 @@ class KeyManager:
             f"{self._pacific_day_str()}::{self._km_id(key, model)}", 0
         )
 
+    # ---------- 在途请求计数（并发公平性） ----------
+
+    def mark_key_inflight(self, key: str, model: str = "") -> None:
+        """标记该 (key, model) 有一个请求正在处理中。"""
+        km_id = self._km_id(key, model or "_")
+        self.key_model_inflight[km_id] = self.key_model_inflight.get(km_id, 0) + 1
+
+    def release_key_inflight(self, key: str, model: str = "") -> None:
+        """释放该 (key, model) 的在途计数（请求结束，无论成败）。"""
+        km_id = self._km_id(key, model or "_")
+        cur = self.key_model_inflight.get(km_id, 0)
+        if cur <= 1:
+            self.key_model_inflight.pop(km_id, None)
+        else:
+            self.key_model_inflight[km_id] = cur - 1
+
+    def get_key_inflight(self, key: str, model: str = "") -> int:
+        return self.key_model_inflight.get(self._km_id(key, model or "_"), 0)
+
     # ---------- 模型级过载（503 high demand） ----------
 
     def record_model_overload(
@@ -571,6 +593,7 @@ class KeyManager:
                     "last_error_code": ev.get("last_error_code"),
                     "error_count": ev.get("error_count", 0),
                     "success_count": self.get_success_count(key, model),
+                    "inflight": self.get_key_inflight(key, model),
                 }
             )
         # 最早恢复只统计仍在冷却的；全过期则 0
@@ -790,18 +813,21 @@ class KeyManager:
                 return available[0]
 
     def _pick_least_used_key(self, available: list, model: str) -> str:
-        """在候选 key 中按 (今日成功次数, 最近使用序号) 选最优。
+        """在候选 key 中按 (在途请求数, 今日成功次数, 最近使用序号) 选最优。
 
-        - 首先比今日成功次数，越少越优先（摊平衡量）；
-        - 同次数时，选"最近最少被选中"的 key（recency 最小），保证轮转公平，
-          不会因排序固定而饿死后面的 key。
+        - **首先比在途请求数**：优先选当前没有其他请求占用的 key，避免多对话
+          并发时全部挤在同一把 key 上、导致别的对话长时间拿不到 key（饿死）。
+        - 其次比今日成功次数，越少越优先（摊平衡量）；
+        - 最后比"最近最少被选中"（recency），保证轮转公平。
         """
         best_key = None
-        best_metric = None  # (success_count, recency)
+        best_metric = None
         for k in available:
-            cnt = self.get_success_count(k, model)
-            recency = self._key_last_picked_seq.get(k, 0)
-            metric = (cnt, recency)
+            metric = (
+                self.get_key_inflight(k, model),
+                self.get_success_count(k, model),
+                self._key_last_picked_seq.get(k, 0),
+            )
             if best_metric is None or metric < best_metric:
                 best_metric = metric
                 best_key = k
