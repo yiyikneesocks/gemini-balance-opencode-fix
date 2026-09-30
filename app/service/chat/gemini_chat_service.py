@@ -404,11 +404,13 @@ class GeminiChatService:
 
         while True:
             try:
-                self.key_manager.mark_key_inflight(current_key, model)
-                try:
-                    return await call(current_key)
-                finally:
-                    self.key_manager.release_key_inflight(current_key, model)
+                # 请求侧排队：拿到该 (key, model) 的名额才调用上游（与分发算法解耦）
+                async with self.key_manager.acquire_key_slot(current_key, model):
+                    self.key_manager.mark_key_inflight(current_key, model)
+                    try:
+                        return await call(current_key)
+                    finally:
+                        self.key_manager.release_key_inflight(current_key, model)
             except Exception as e:
                 category, status_code, message = classify_and_extract(e)
                 logger.warning(
@@ -730,7 +732,12 @@ class GeminiChatService:
             request_datetime = datetime.datetime.now()
             start_time = time.perf_counter()
             final_api_key = current_key
-            self.key_manager.mark_key_inflight(current_key, model)
+            # 请求侧排队：拿到该 (key, model) 的名额才调用上游（与分发算法解耦）。
+            # 注意：名额需覆盖整个流式过程（含 yield），故在 finally 中归还。
+            # 用局部变量锁定本次尝试的 key，避免异常分支改写 current_key 后归还错名额。
+            attempt_key = current_key
+            await self.key_manager._get_gate(attempt_key, model).acquire()
+            self.key_manager.mark_key_inflight(attempt_key, model)
             try:
                 async for line in self.api_client.stream_generate_content(
                     payload, model, current_key
@@ -960,7 +967,8 @@ class GeminiChatService:
                     model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
                 ) from e
             finally:
-                self.key_manager.release_key_inflight(current_key, model)
+                self.key_manager.release_key_inflight(attempt_key, model)
+                self.key_manager._get_gate(attempt_key, model).release()
                 end_time = time.perf_counter()
                 latency_ms = int((end_time - start_time) * 1000)
                 await add_request_log(

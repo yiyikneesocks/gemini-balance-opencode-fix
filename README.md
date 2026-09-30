@@ -66,19 +66,23 @@ client **stops retrying immediately** instead of spinning, and reports a clear
 
 ### 3. Load balancing by daily usage
 
-Requests go to the available key with the **fewest successful calls today**,
-skipping the key used last — so a single key is never burst into its RPM limit.
-The rate-limit cooldown remains the hard backstop.
+Requests go to the available key with the **fewest in-flight requests**, then the
+**fewest successful calls today**, skipping the key used last — so a single key is
+never burst into its RPM limit. The rate-limit cooldown remains the hard backstop.
+
+Requests also **queue per `(key, model)`**: each request acquires a slot for its
+chosen key/model before calling upstream and releases it when done. The dispatch
+algorithm is fully independent of these queues and each `(key, model)` has its own
+slot pool, so different models never block each other. Capacity is
+`KEY_MODEL_CONCURRENCY` (default 1).
 
 ### 4. Persistence (survives restarts)
-
 New table **`t_key_model_state`** stores per-`(key, model)` cooldown and daily
 statistics; keys are stored as SHA256 (**no plaintext**). State is restored on
 startup and stale rows are cleaned hourly. New columns are added by a lightweight
 auto-migration.
 
 ### 5. `/model-cooldown` dashboard
-
 A new page (with a navigation button) shows today's `(key, model)` pairs that hit
 429/503: masked key, status badge (`RPD exhausted` / `Cooling` / `Available`),
 last error type, remaining cooldown, last error time, and **today's success /

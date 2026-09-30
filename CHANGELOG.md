@@ -6,6 +6,17 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
+### Per-`(key, model)` request queues, decoupled from dispatch
+
+- Requests no longer race for keys. Each request must first acquire a **slot** for
+  the chosen `(key, model)` (`acquire_key_slot`); if the slot pool is full it waits in
+  its own queue. When done it releases the slot and the next waiter proceeds.
+- The **dispatch algorithm is untouched and independent**: it only knows about model
+  cooldowns and rotation — it has no knowledge of who is queued.
+- Each `(key, model)` has its **own** slot pool, so different models never block each
+  other. Capacity is `KEY_MODEL_CONCURRENCY` (default 1: one in-flight call per
+  `(key, model)`; raise it for higher throughput).
+
 ### Concurrency fairness: no more starvation between simultaneous conversations
 
 - Previously there was no notion of a key being **in use**: two conversations could
