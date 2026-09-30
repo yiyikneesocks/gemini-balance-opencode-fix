@@ -70,8 +70,11 @@ The backend's dispatch is deliberately simple and **request-agnostic**: it only
 (1) hands out a key, (2) decides which key comes next, and (3) maintains the
 cooldown / error logic. It does not track requests or their queues.
 
-- It picks the available key with the **fewest successful calls today** (ties broken
-  by least-recently-picked), which spreads the day's load evenly across keys.
+- **Top priority: do not repeat a key too soon.** The same key is not handed out
+  again until at least `KEY_REPEAT_GAP` (default 2) other selections have happened
+  in between, so the same key is never repeated back-to-back.
+- Among the keys that satisfy that gap, it picks the available one with the **fewest
+  successful calls today** (ties broken by least-recently-picked), spreading the load.
 - Cooling / invalid keys are skipped; a cooling key is immediately unavailable.
 - Selecting a key never waits for a previous call on it to finish.
 

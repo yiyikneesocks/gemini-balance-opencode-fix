@@ -11,10 +11,11 @@ Upstream code is otherwise unchanged.
 - The backend's dispatch is intentionally simple and **request-agnostic**: it only
   (1) hands out a key, (2) decides which key comes next, (3) maintains cooldown /
   error logic. It does not track requests or queues.
-- Key selection uses the original algorithm: pick the available key with the fewest
-  successful calls today (ties broken by least-recently-picked), spreading the day's
-  load. Cooling / invalid keys are skipped; selecting a key never waits for a
-  previous call on it to finish.
+- Key selection gives **top priority to not repeating a key too soon**: the same key
+  is not reused until at least `KEY_REPEAT_GAP` (default 2) other selections have
+  happened. Among keys satisfying that gap, it picks the available one with the
+  fewest successful calls today (ties broken by least-recently-picked). Cooling /
+  invalid keys are skipped; selecting a key never waits for a previous call on it.
 
 ### Concurrency fairness: no more starvation between simultaneous conversations
 

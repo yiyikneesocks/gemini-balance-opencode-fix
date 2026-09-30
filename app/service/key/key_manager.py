@@ -45,6 +45,10 @@ class KeyManager:
         # 负载均衡：全局选中序号 + 每个 key 最近一次被选中的序号（用于同次数轮转）
         self._pick_seq: int = 0
         self._key_last_picked_seq: Dict[str, int] = {}
+        # 最近若干次选中的 key（按模型）：<model> -> [最近依次选中的 key...]
+        # 用于"避免同一把 key 连续/过近地被重复发"——同一把 key 两次被选中之间
+        # 至少要隔开 KEY_REPEAT_GAP 次其他选择。
+        self._recent_picks: Dict[str, list] = {}
         # 模型级过载（503 high demand）计数：model -> 连续过载次数
         # 过载是模型全局现象，换 key 无效，因此单独统计并在达到阈值时中断。
         self.model_overload_counts: Dict[str, int] = {}
@@ -740,9 +744,11 @@ class KeyManager:
 
         分发规则（只做"发 key / 决定下一个发谁 / 维护冷却"，不管请求队列）：
         1. 取所有可用 key（有效且未冷却）；
-        2. 优先选"今日成功次数最少"的一把（把当日用量摊平——一直以来的算法）；
-        3. 同次数时选"最近最少被选中"的（recency），保证轮转公平；
-        4. 冷却中/失效一律跳过；若全都不可用则返回 None。
+        2. **最高优先级：避免最近发过的 key 被再次发**——同一把 key 两次被选中之间
+           至少隔开 KEY_REPEAT_GAP 次其他选择（默认 2，即中间至少隔 2 把别的 key）；
+        3. 在满足间隔的候选里，选"今日成功次数最少"的一把（摊平当日用量）；
+        4. 同次数时选"最近最少被选中"的（recency）轮转；
+        5. 冷却中/失效一律跳过；若都不可用返回 None。
 
         真正的"限流规避"交给 (key, model) 冷却；本函数只负责决定下一把发哪把 key，
         不关心请求是谁、也不关心上一把 key 是否还在处理。
@@ -759,16 +765,36 @@ class KeyManager:
         if not available:
             return None
 
-        picked = self._pick_least_used_key(available, model)
+        # 最近刚发过的 key（按模型），用于拉开重复间隔
+        recent = self._recent_picks.get(model or "_", [])
+
+        # 最高优先级：优先在不含"最近发过的 key"的候选里选，保证间隔
+        if len(available) > 1:
+            gap = max(1, settings.KEY_REPEAT_GAP)
+            forbidden = set(recent[-gap:]) if recent else set()
+            fresh = [k for k in available if k not in forbidden]
+            # 若所有可用 key 都在最近发过之列（可用 key 数量 <= gap），
+            # 退而求其次：至少排除"上一次"发过的 key，避免背靠背重复。
+            if not fresh:
+                fresh = [k for k in available if k != recent[-1]] or available
+            pool = fresh
+        else:
+            pool = available
+
+        picked = self._pick_least_used_key(pool, model)
         self._pick_seq += 1
         self._key_last_picked_seq[picked] = self._pick_seq
+        # 记录最近选择序列（只保留末尾 gap 个即可）
+        gap = max(1, settings.KEY_REPEAT_GAP)
+        recent = recent + [picked]
+        self._recent_picks[model or "_"] = recent[-(gap + 1):]
         return picked
 
     def _pick_least_used_key(self, available: list, model: str) -> str:
         """在候选 key 中按 (今日成功次数, 最近使用序号) 选最优。
 
-        - 首先比今日成功次数，越少越优先（把当日用量摊平——这就是我们一直的算法）；
-        - 同次数时选"最近最少被选中"的（recency），保证同批 key 之间轮转公平，
+        - 首先比今日成功次数，越少越优先（把当日用量摊平——我们一直的算法）；
+        - 同次数时选"最近最少被选中"的（recency），保证同一批 key 之间轮转公平，
           不会因排序固定而总是挑第一把。
         """
         best_key = None

@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     OVERLOAD_KEYS_BEFORE_GIVEUP: int = 3
     # 模型级过载冷却基数（秒）：过载时给该模型所有 key 记一个短冷却，避免立即重试
     OVERLOAD_MODEL_COOLDOWN_S: float = 5.0
+    # 分发：同一把 key 两次被选中之间至少隔开的其他选择次数（避免重复发同一把 key）。
+    # 这是最高优先级——先拉开重复间隔，再按"今日成功次数最少"选。
+    KEY_REPEAT_GAP: int = 2
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []
