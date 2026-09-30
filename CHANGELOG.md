@@ -6,14 +6,14 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
-### Dispatch is state-based and non-blocking
+### Dispatch: one key per round, reuse only after a full round
 
-- The backend knows each key's state (cooling / rate-limited / invalid / available)
-  and hands out **any available key immediately** — it does not wait for a previous
-  call on that key to finish. Only cooling or invalid keys are skipped.
-- Key selection prefers the fewest **in-flight** requests, then fewest successful
-  calls today, then least-recently picked. In-flight is only a soft spreading
-  preference; it never blocks a request.
+- Key selection first excludes keys that are **currently in-flight**, so two
+  concurrent requests never receive the same key. Only when every available key has
+  been handed out once is an in-flight key reused (then fewest-today-success +
+  round-robin tie-break).
+- Cooling / invalid keys are always skipped. Dispatch is state-based and never waits
+  for a previous call on a key to finish.
 
 ### Concurrency fairness: no more starvation between simultaneous conversations
 

@@ -764,15 +764,16 @@ class KeyManager:
     async def get_next_working_key(self, model: str = "") -> Optional[str]:
         """获取指定模型下一可用 key：跳过失效（失败数超限）与冷却中的 (key, model)。
 
-        负载均衡策略（BALANCE_BY_SUCCESS_COUNT）：
-        1. 先排除"上一次刚选过"的 key（若还有其他可用 key），避免短时间内
-           反复命中同一把 key 而触发单 key RPM 限流；
-        2. 在剩余可用 key 中，优先选"今日成功次数最少"的一把，把当日总量摊平；
-        3. 同成功次数时按内部计数器轮转，避免固定偏袒某个 key。
+        分发规则（"一轮内不重复，轮完才复用"）：
+        1. 先取所有可用 key（有效且未冷却）；
+        2. 优先分发给**当前没有在途请求**的 key——保证并发请求各自拿到不同的 key，
+           不会连续把同一把 key 分给两个请求；
+        3. 只有当所有可用 key 都已在途（这一轮已经轮完）时，才复用某个在途 key
+           （此时按今日成功次数最少 + 轮转公平来选）；
+        4. 冷却中/失效的 key 一律跳过；若全都不可用则返回 None。
 
-        即：真正的"限流规避"交给 (key, model) 冷却，本函数只负责把请求尽量
-        均匀地分派到不同 key，而不是把某一把 key 连续刷到冷却。
-        若所有 key 都在冷却，返回 None，由调用方决定等待最早到期或直接失败。
+        真正的"限流规避"交给 (key, model) 冷却；本函数只负责把请求尽量均匀地
+        分派到不同 key，避免单 key 被连续刷爆。
         """
         # 收集所有当前可用（有效且未冷却）的 key
         available: list = []
@@ -786,32 +787,19 @@ class KeyManager:
         if not available:
             return None
 
-        if settings.BALANCE_BY_SUCCESS_COUNT:
-            # 避免连续命中同一把 key（防单 key RPM 突发）：若上次选中的 key 仍在
-            # 可用集合里且有其他可用 key，本轮先把它排除，靠"换 key"分摊瞬时压力。
-            last = self._last_picked_key.get(model or "_")
-            candidates = (
-                [k for k in available if k != last]
-                if len(available) > 1 and last in available
-                else available
-            )
-            picked = self._pick_least_used_key(candidates, model)
-            self._pick_seq += 1
-            self._key_last_picked_seq[picked] = self._pick_seq
-            self._last_picked_key[model or "_"] = picked
-            return picked
+        # 优先选择"当前没有在途请求"的 key：一个 key 这一轮只分一次
+        free = [k for k in available if self.get_key_inflight(k, model) == 0]
+        pool = free if free else available
 
-        # 保留原有轮询语义（未开启均衡时）
-        async with self.key_cycle_lock:
-            initial_key = next(self.key_cycle)
-        current_key = initial_key
-        while True:
-            if current_key in available:
-                return current_key
-            async with self.key_cycle_lock:
-                current_key = next(self.key_cycle)
-            if current_key == initial_key:
-                return available[0]
+        picked = self._pick_least_used_key(pool, model)
+        self._pick_seq += 1
+        self._key_last_picked_seq[picked] = self._pick_seq
+        self._last_picked_key[model or "_"] = picked
+        logger.debug(
+            f"Dispatch model={model or '_'}: available={len(available)} "
+            f"free={len(free)} -> {redact_key_for_logging(picked)}"
+        )
+        return picked
 
     def _pick_least_used_key(self, available: list, model: str) -> str:
         """在候选 key 中按 (在途请求数, 今日成功次数, 最近使用序号) 选最优。
