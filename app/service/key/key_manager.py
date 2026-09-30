@@ -45,17 +45,11 @@ class KeyManager:
         # 负载均衡：全局选中序号 + 每个 key 最近一次被选中的序号（用于同次数轮转）
         self._pick_seq: int = 0
         self._key_last_picked_seq: Dict[str, int] = {}
-        # 每个模型上一次选中的 key（避免连续命中同一把，规避单 key RPM 突发）
-        self._last_picked_key: Dict[str, str] = {}
         # 模型级过载（503 high demand）计数：model -> 连续过载次数
         # 过载是模型全局现象，换 key 无效，因此单独统计并在达到阈值时中断。
         self.model_overload_counts: Dict[str, int] = {}
         # 模型级过载冷却截止时间（monotonic）：model -> until
         self.model_overload_until: Dict[str, float] = {}
-        # 在途请求计数："<key>::<model>" -> 正在进行中的请求数。
-        # 仅用于分发时的软性均衡（优先挑在途少的 key），**不会阻塞**请求：
-        # 只要 key 空闲（未冷却、未失效）就立即分发，不等前一次调用结束。
-        self.key_model_inflight: Dict[str, int] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -359,25 +353,6 @@ class KeyManager:
             f"{self._pacific_day_str()}::{self._km_id(key, model)}", 0
         )
 
-    # ---------- 在途请求计数（并发公平性） ----------
-
-    def mark_key_inflight(self, key: str, model: str = "") -> None:
-        """标记该 (key, model) 有一个请求正在处理中。"""
-        km_id = self._km_id(key, model or "_")
-        self.key_model_inflight[km_id] = self.key_model_inflight.get(km_id, 0) + 1
-
-    def release_key_inflight(self, key: str, model: str = "") -> None:
-        """释放该 (key, model) 的在途计数（请求结束，无论成败）。"""
-        km_id = self._km_id(key, model or "_")
-        cur = self.key_model_inflight.get(km_id, 0)
-        if cur <= 1:
-            self.key_model_inflight.pop(km_id, None)
-        else:
-            self.key_model_inflight[km_id] = cur - 1
-
-    def get_key_inflight(self, key: str, model: str = "") -> int:
-        return self.key_model_inflight.get(self._km_id(key, model or "_"), 0)
-
     # ---------- 模型级过载（503 high demand） ----------
 
     def record_model_overload(
@@ -594,7 +569,6 @@ class KeyManager:
                     "last_error_code": ev.get("last_error_code"),
                     "error_count": ev.get("error_count", 0),
                     "success_count": self.get_success_count(key, model),
-                    "inflight": self.get_key_inflight(key, model),
                 }
             )
         # 最早恢复只统计仍在冷却的；全过期则 0
@@ -764,16 +738,14 @@ class KeyManager:
     async def get_next_working_key(self, model: str = "") -> Optional[str]:
         """获取指定模型下一可用 key：跳过失效（失败数超限）与冷却中的 (key, model)。
 
-        分发规则（"一轮内不重复，轮完才复用"）：
-        1. 先取所有可用 key（有效且未冷却）；
-        2. 优先分发给**当前没有在途请求**的 key——保证并发请求各自拿到不同的 key，
-           不会连续把同一把 key 分给两个请求；
-        3. 只有当所有可用 key 都已在途（这一轮已经轮完）时，才复用某个在途 key
-           （此时按今日成功次数最少 + 轮转公平来选）；
-        4. 冷却中/失效的 key 一律跳过；若全都不可用则返回 None。
+        分发规则（只做"发 key / 决定下一个发谁 / 维护冷却"，不管请求队列）：
+        1. 取所有可用 key（有效且未冷却）；
+        2. 优先选"今日成功次数最少"的一把（把当日用量摊平——一直以来的算法）；
+        3. 同次数时选"最近最少被选中"的（recency），保证轮转公平；
+        4. 冷却中/失效一律跳过；若全都不可用则返回 None。
 
-        真正的"限流规避"交给 (key, model) 冷却；本函数只负责把请求尽量均匀地
-        分派到不同 key，避免单 key 被连续刷爆。
+        真正的"限流规避"交给 (key, model) 冷却；本函数只负责决定下一把发哪把 key，
+        不关心请求是谁、也不关心上一把 key 是否还在处理。
         """
         # 收集所有当前可用（有效且未冷却）的 key
         available: list = []
@@ -787,33 +759,22 @@ class KeyManager:
         if not available:
             return None
 
-        # 优先选择"当前没有在途请求"的 key：一个 key 这一轮只分一次
-        free = [k for k in available if self.get_key_inflight(k, model) == 0]
-        pool = free if free else available
-
-        picked = self._pick_least_used_key(pool, model)
+        picked = self._pick_least_used_key(available, model)
         self._pick_seq += 1
         self._key_last_picked_seq[picked] = self._pick_seq
-        self._last_picked_key[model or "_"] = picked
-        logger.debug(
-            f"Dispatch model={model or '_'}: available={len(available)} "
-            f"free={len(free)} -> {redact_key_for_logging(picked)}"
-        )
         return picked
 
     def _pick_least_used_key(self, available: list, model: str) -> str:
-        """在候选 key 中按 (在途请求数, 今日成功次数, 最近使用序号) 选最优。
+        """在候选 key 中按 (今日成功次数, 最近使用序号) 选最优。
 
-        - **首先比在途请求数**：优先选当前没有其他请求占用的 key，避免多对话
-          并发时全部挤在同一把 key 上、导致别的对话长时间拿不到 key（饿死）。
-        - 其次比今日成功次数，越少越优先（摊平衡量）；
-        - 最后比"最近最少被选中"（recency），保证轮转公平。
+        - 首先比今日成功次数，越少越优先（把当日用量摊平——这就是我们一直的算法）；
+        - 同次数时选"最近最少被选中"的（recency），保证同批 key 之间轮转公平，
+          不会因排序固定而总是挑第一把。
         """
         best_key = None
         best_metric = None
         for k in available:
             metric = (
-                self.get_key_inflight(k, model),
                 self.get_success_count(k, model),
                 self._key_last_picked_seq.get(k, 0),
             )

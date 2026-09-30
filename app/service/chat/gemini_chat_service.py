@@ -404,12 +404,7 @@ class GeminiChatService:
 
         while True:
             try:
-                # 标记在途（仅用于分发时的软性均衡），不阻塞：key 空闲即用
-                self.key_manager.mark_key_inflight(current_key, model)
-                try:
-                    return await call(current_key)
-                finally:
-                    self.key_manager.release_key_inflight(current_key, model)
+                return await call(current_key)
             except Exception as e:
                 category, status_code, message = classify_and_extract(e)
                 logger.warning(
@@ -731,10 +726,6 @@ class GeminiChatService:
             request_datetime = datetime.datetime.now()
             start_time = time.perf_counter()
             final_api_key = current_key
-            # 标记在途（仅用于分发时的软性均衡），不阻塞：key 空闲即用。
-            # 用局部变量锁定本次尝试的 key，避免异常分支改写 current_key 后释放错计数。
-            attempt_key = current_key
-            self.key_manager.mark_key_inflight(attempt_key, model)
             try:
                 async for line in self.api_client.stream_generate_content(
                     payload, model, current_key
@@ -964,7 +955,6 @@ class GeminiChatService:
                     model=model, model_hints=hints, rpd_exhausted=rpd_exhausted
                 ) from e
             finally:
-                self.key_manager.release_key_inflight(attempt_key, model)
                 end_time = time.perf_counter()
                 latency_ms = int((end_time - start_time) * 1000)
                 await add_request_log(

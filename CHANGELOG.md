@@ -6,14 +6,15 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
-### Dispatch: one key per round, reuse only after a full round
+### Dispatch: request-agnostic key rotation
 
-- Key selection first excludes keys that are **currently in-flight**, so two
-  concurrent requests never receive the same key. Only when every available key has
-  been handed out once is an in-flight key reused (then fewest-today-success +
-  round-robin tie-break).
-- Cooling / invalid keys are always skipped. Dispatch is state-based and never waits
-  for a previous call on a key to finish.
+- The backend's dispatch is intentionally simple and **request-agnostic**: it only
+  (1) hands out a key, (2) decides which key comes next, (3) maintains cooldown /
+  error logic. It does not track requests or queues.
+- Key selection uses the original algorithm: pick the available key with the fewest
+  successful calls today (ties broken by least-recently-picked), spreading the day's
+  load. Cooling / invalid keys are skipped; selecting a key never waits for a
+  previous call on it to finish.
 
 ### Concurrency fairness: no more starvation between simultaneous conversations
 

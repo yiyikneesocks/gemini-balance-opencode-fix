@@ -228,9 +228,6 @@ content %}
             <td class="px-3 py-2 text-right text-xs text-gray-400">${esc(k.last_error_time || "")}</td>
             <td class="px-3 py-2 text-right font-mono text-sm text-blue-600">${k.success_count ?? 0}</td>
             <td class="px-3 py-2 text-right font-mono text-xs text-gray-400">${k.error_count ?? 0}</td>
-            <td class="px-3 py-2 text-right font-mono text-xs ${
-              (k.inflight ?? 0) > 0 ? "text-orange-600 font-semibold" : "text-gray-300"
-            }">${k.inflight ?? 0}</td>
           </tr>`;
           })
           .join("");
@@ -271,7 +268,6 @@ content %}
                   <th class="px-3 py-1.5 text-right">最近错误时间</th>
                   <th class="px-3 py-1.5 text-right">今日成功</th>
                   <th class="px-3 py-1.5 text-right">今日出错</th>
-                  <th class="px-3 py-1.5 text-right">在途</th>
                 </tr>
               </thead>
               <tbody>${rows}</tbody>

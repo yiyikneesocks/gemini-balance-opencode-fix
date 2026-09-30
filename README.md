@@ -66,15 +66,14 @@ client **stops retrying immediately** instead of spinning, and reports a clear
 
 ### 3. Load balancing by daily usage
 
-Requests go to an **available key that is not currently in-flight**, so two
-concurrent requests never receive the same key. Only after every available key has
-been handed out once (a full round) is an in-flight key reused. Among candidates the
-fewest successful calls today wins, with round-robin tie-breaking. Cooling or
-invalid keys are always skipped; the rate-limit cooldown remains the hard backstop.
+The backend's dispatch is deliberately simple and **request-agnostic**: it only
+(1) hands out a key, (2) decides which key comes next, and (3) maintains the
+cooldown / error logic. It does not track requests or their queues.
 
-Dispatch is **state-based and non-blocking**: the backend knows each key's state
-(cooling / rate-limited / invalid / available) and hands out an available key
-immediately — it does **not** wait for a previous call on that key to finish.
+- It picks the available key with the **fewest successful calls today** (ties broken
+  by least-recently-picked), which spreads the day's load evenly across keys.
+- Cooling / invalid keys are skipped; a cooling key is immediately unavailable.
+- Selecting a key never waits for a previous call on it to finish.
 
 ### 4. Persistence (survives restarts)
 New table **`t_key_model_state`** stores per-`(key, model)` cooldown and daily
