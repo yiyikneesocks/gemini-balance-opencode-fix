@@ -72,10 +72,6 @@ class Settings(BaseSettings):
     RPD_PROBE_ATTEMPTS: int = 2  # 即使全池 RPD 耗尽，也额外探测重试的轮数（配额可能已重置）
     # 负载均衡：优先选择"今日成功次数最少"的可用 key，避免个别 key 被反复刷爆 TPM
     BALANCE_BY_SUCCESS_COUNT: bool = True
-    # 每个 (key, model) 允许的最大并发在途请求数（请求各自的排队名额）。
-    # 与分发算法解耦：分发只管模型冷却与轮换，请求先在此排队拿名额再调上游。
-    # 1 = 同一 key 同一模型同一时刻只跑一个（最有序）；越大吞吐越高但越易触发 RPM。
-    KEY_MODEL_CONCURRENCY: int = 1
     # 网络不可达时返回给客户端的 HTTP 状态码。
     # AI SDK / opencode 仅对 408/409/429/5xx 判定为可重试；默认 424（Failed Dependency）
     # 属于"不可重试"，可让 opencode 立刻停止重试、直接报错，避免全池空转刷屏。

@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import time
 import random
 from itertools import cycle
@@ -54,12 +53,9 @@ class KeyManager:
         # 模型级过载冷却截止时间（monotonic）：model -> until
         self.model_overload_until: Dict[str, float] = {}
         # 在途请求计数："<key>::<model>" -> 正在进行中的请求数。
-        # 用于避免多对话并发时全部挤在同一把 key 上，导致其他对话被饿死。
+        # 仅用于分发时的软性均衡（优先挑在途少的 key），**不会阻塞**请求：
+        # 只要 key 空闲（未冷却、未失效）就立即分发，不等前一次调用结束。
         self.key_model_inflight: Dict[str, int] = {}
-        # 每个 (key, model) 的并发闸门（名额池）：请求必须先拿到名额才能调用上游，
-        # 名额满则在各自的队列里等待。与"分发算法"解耦——分发只管冷却与轮换，
-        # 不知道也不关心请求如何排队。不同 (key, model) 的闸门互相独立。
-        self.key_model_gates: Dict[str, asyncio.Semaphore] = {}
         self.error_today_day: str = ""  # 记录事件属于哪一天，跨天自动清空
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -381,35 +377,6 @@ class KeyManager:
 
     def get_key_inflight(self, key: str, model: str = "") -> int:
         return self.key_model_inflight.get(self._km_id(key, model or "_"), 0)
-
-    # ---------- 每个 (key, model) 的并发闸门（名额池） ----------
-
-    def _get_gate(self, key: str, model: str = "") -> asyncio.Semaphore:
-        """取得（或惰性创建）该 (key, model) 的名额池。
-
-        容量 = settings.KEY_MODEL_CONCURRENCY。不同 (key, model) 各自独立，
-        互不阻塞；分发算法不需要知道闸门的存在。
-        """
-        km_id = self._km_id(key, model or "_")
-        gate = self.key_model_gates.get(km_id)
-        if gate is None:
-            gate = asyncio.Semaphore(max(1, settings.KEY_MODEL_CONCURRENCY))
-            self.key_model_gates[km_id] = gate
-        return gate
-
-    @contextlib.asynccontextmanager
-    async def acquire_key_slot(self, key: str, model: str = ""):
-        """请求侧排队：拿到该 (key, model) 的一个名额才继续，否则排队等待。
-
-        这是与"分发算法"无关的独立一层——请求只管排队拿名额；
-        拿不到就等，拿到就调用上游，退出时自动归还名额。
-        """
-        gate = self._get_gate(key, model)
-        await gate.acquire()
-        try:
-            yield
-        finally:
-            gate.release()
 
     # ---------- 模型级过载（503 high demand） ----------
 

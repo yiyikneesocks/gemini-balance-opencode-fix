@@ -70,11 +70,10 @@ Requests go to the available key with the **fewest in-flight requests**, then th
 **fewest successful calls today**, skipping the key used last — so a single key is
 never burst into its RPM limit. The rate-limit cooldown remains the hard backstop.
 
-Requests also **queue per `(key, model)`**: each request acquires a slot for its
-chosen key/model before calling upstream and releases it when done. The dispatch
-algorithm is fully independent of these queues and each `(key, model)` has its own
-slot pool, so different models never block each other. Capacity is
-`KEY_MODEL_CONCURRENCY` (default 1).
+Dispatch is **state-based and non-blocking**: the backend knows each key's state
+(cooling / rate-limited / invalid / available) and hands out any available key
+immediately — it does **not** wait for a previous call on that key to finish. Only
+cooling or invalid keys are skipped.
 
 ### 4. Persistence (survives restarts)
 New table **`t_key_model_state`** stores per-`(key, model)` cooldown and daily
