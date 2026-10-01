@@ -100,6 +100,20 @@
 （`@ai-sdk/provider/.../api-call-error.ts:28-32`）。这三类重试无意义（网络断/日配额尽/模型全局过载），
 返回 424 让客户端**立即停止重试**；瞬时限流保持 429 让客户端正常退避重试。
 
+> ⚠️ **关键坑：状态码不是唯一判定依据。** opencode 还有第二道"可重试"判定——
+> 对**错误 message 与 responseBody 做正则匹配**（见 `~/CodingProgram/opencode-config/RETRY-POLICY.md`
+> §3）：命中 `network error` / `connection error` / `timeout` / `overloaded` /
+> `at capacity` / 数字 `429|500|502|503|504|524` 等，**即使状态码是 424 也会被重试**。
+>
+> 因此 424 的**文案必须避开这些触发词**：
+> - `UpstreamNetworkError`：**不回显原始异常文本**（`ConnectError`/`timed out` 等会命中正则），
+>   原始文本只进日志（`raw_detail`），客户端只看到固定安全文案。
+> - `UpstreamOverloadError`：不得出现 `503` / `overloaded` 字样。
+> - `AllKeysCoolingError`（RPD 424）：不得出现 "quota exceeded"/"resource exhausted" 等。
+>
+> 相反，**429 瞬时限流**我们**希望** opencode 重试，所以其文案可含触发词，且会带
+> `Retry-After` 头——opencode 会优先遵守该头（不被 30s 上限 clamp），实现"我们说多久就等多久"。
+
 ### 1.4 熔断器（424 快速失败窗口）
 
 一旦真的返回 424，说明重试无意义。为避免"每个新请求都再走一遍重试流程然后同样 424"的空转，

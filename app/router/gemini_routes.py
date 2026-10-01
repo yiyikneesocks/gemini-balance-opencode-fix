@@ -20,6 +20,7 @@ from app.handler.retry_handler import RetryHandler
 from app.log.logger import get_gemini_logger
 from app.service.chat.gemini_chat_service import GeminiChatService
 from app.service.embedding.gemini_embedding_service import GeminiEmbeddingService
+from app.exception.exceptions import AllKeysCoolingError, UpstreamOverloadError
 from app.service.key.key_manager import KeyManager, get_key_manager_instance
 from app.service.model.model_service import ModelService
 from app.service.tts.native.tts_routes import get_tts_chat_service
@@ -55,15 +56,16 @@ async def get_next_working_key(
     # 熔断窗口内：直接返回与"首个触发者"相同的 424，快速失败
     active = key_manager.get_active_breaker_error(model)
     if active is not None:
-        raise HTTPException(status_code=settings.NETWORK_ERROR_STATUS_CODE, detail=active)
+        raise UpstreamOverloadError(model=model, detail=active)
     key = await key_manager.get_next_working_key(model)
     if key:
         return key
     # 仅当每把 key 都是 RPD 日耗尽时，等待无意义（直接换模型建议）
     all_rpd = key_manager.all_keys_rpd_exhausted(model)
+    wait_s = 0.0
     if not all_rpd:
         # 部分/全部为短冷却：等最早到期的 key（封顶 ALL_COOLING_MAX_WAIT_S）再取一次
-        wait_s = await key_manager.earliest_cooldown_release(model)
+        wait_s = await key_manager.earliest_cooldown_release(model) or 0.0
         if wait_s:
             wait_s = min(wait_s, settings.ALL_COOLING_MAX_WAIT_S)
             logger.info(
@@ -74,22 +76,14 @@ async def get_next_working_key(
             await asyncio.sleep(wait_s)
             key = await key_manager.get_next_working_key(model)
     if not key:
-        # 仍无可用 key：返回 429 语义 + 建议换模型（客户端侧自行退避重试）
+        # 仍无可用 key：复用统一异常（安全文案 + 正确状态码/Retry-After）
         hints = key_manager.get_available_models_hint(exclude_model=model)
-        if all_rpd:
-            detail = (
-                f"Daily quota (RPD) for model '{model or 'requested model'}' is "
-                f"exhausted on all API keys. Retrying will NOT help until quota "
-                f"resets. Please switch to another model."
-            )
-        else:
-            detail = (
-                "All API keys are rate-limited or cooling down. "
-                "Please retry later."
-            )
-        if hints:
-            detail += f" Models with available quota: {', '.join(hints)}."
-        raise HTTPException(status_code=429, detail=detail)
+        raise AllKeysCoolingError(
+            model=model,
+            retry_after_s=(wait_s or settings.ALL_COOLING_MAX_WAIT_S),
+            model_hints=hints,
+            rpd_exhausted=all_rpd,
+        )
     return key
 
 

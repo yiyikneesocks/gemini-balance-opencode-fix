@@ -13,12 +13,23 @@ logger = get_exceptions_logger()
 
 
 class APIError(Exception):
-    """API错误基类"""
+    """API错误基类
 
-    def __init__(self, status_code: int, detail: str, error_code: str = None):
+    retry_after: 可选的建议重试秒数；设置后会在响应里带 `Retry-After` 头。
+    opencode/AI SDK 会优先遵守该头（不被 30s 上限 clamp），实现"我们说多久就等多久"。
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        error_code: str = None,
+        retry_after: float = None,
+    ):
         self.status_code = status_code
         self.detail = detail
         self.error_code = error_code or "api_error"
+        self.retry_after = retry_after
         super().__init__(self.detail)
 
 
@@ -82,30 +93,42 @@ class UpstreamNetworkError(APIError):
     默认返回 NETWORK_ERROR_STATUS_CODE（默认 424）——AI SDK / opencode 只把
     408/409/429/5xx 视为可重试，424 属于"不可重试"，据此让 opencode 立刻停止
     重试、直接报错，避免网络真断时全池空转、日志刷屏。
+
+    ⚠️ 文案必须避开 opencode 的"可重试"正则（见 opencode-config/RETRY-POLICY.md
+    §3）：message/body 命中 `network error`/`connection error`/`timeout`/`5xx数字`
+    等字样，即使状态码是 424 也会被重试。因此**不要回显原始异常文本**。
     """
 
-    def __init__(self, detail: str):
+    # 面向客户端的固定文案：刻意不含任何可重试触发词
+    SAFE_DETAIL = (
+        "The proxy cannot reach the upstream provider right now. "
+        "Please check your link, then pick a different model to continue."
+    )
+
+    def __init__(self, detail: str = ""):
         try:
             from app.config.config import settings
 
             status = settings.NETWORK_ERROR_STATUS_CODE
         except Exception:
             status = 424
+        # 原始 detail 只用于日志（见 error_log），不放入客户端文案
+        self.raw_detail = detail
         super().__init__(
             status_code=status,
-            detail=(
-                f"Network error: {detail}. Upstream Gemini API is unreachable. "
-                f"Please check network connectivity. Not retryable."
-            ),
+            detail=self.SAFE_DETAIL,
             error_code="network_error",
         )
 
 
 class UpstreamOverloadError(APIError):
-    """上游模型持续过载（503 high demand），换 key 无效，应换模型。
+    """上游模型持续过载（high demand），换 key 无效，应换模型。
 
     返回不可重试状态码，让客户端立即停止重试并改用其他模型。
     也用于熔断窗口内复用"首个触发者"的错误文案（detail 显式传入时原样使用）。
+
+    ⚠️ 文案避开 opencode 可重试正则：不含 `503`/`overloaded`/`at capacity`
+    等字样（否则 424 仍会被重试，见 opencode-config/RETRY-POLICY.md §3）。
     """
 
     def __init__(self, model: str = "", model_hints=None, detail: str = ""):
@@ -118,13 +141,13 @@ class UpstreamOverloadError(APIError):
             status = 424
         if not detail:
             detail = (
-                f"Upstream model '{model or 'requested model'}' is overloaded "
-                f"(503 high demand) across all API keys. Switching keys does NOT help. "
-                f"Please switch to another model."
+                f"The upstream model '{model or 'requested model'}' is busy on the "
+                f"provider side, and other keys will not help. "
+                f"Please select another model to continue."
             )
             if self.model_hints:
                 detail += (
-                    f" Models that may be available: {', '.join(self.model_hints)}."
+                    f" Models you can try: {', '.join(self.model_hints)}."
                 )
         super().__init__(status_code=status, detail=detail, error_code="upstream_overload")
 
@@ -150,9 +173,9 @@ class AllKeysCoolingError(APIError):
         model_part = f" for model '{model}'" if model else ""
         if rpd_exhausted:
             detail = (
-                f"Daily quota (RPD) for model '{model or 'requested model'}' is "
-                f"exhausted on all API keys. Retrying will NOT help until quota "
-                f"resets. Please switch to another model."
+                f"The daily allowance for model '{model or 'requested model'}' is "
+                f"spent on every key. It refreshes at the provider's midnight, so "
+                f"re-sending now will not help. Please choose another model."
             )
         else:
             detail = (
@@ -166,8 +189,10 @@ class AllKeysCoolingError(APIError):
                 f" Models with available quota: {', '.join(self.model_hints)}."
             )
         # RPD 日耗尽：重试无意义 → 返回不可重试状态码（默认 424），让 opencode
-        # 立即停止重试并提示换模型；普通瞬时限流仍用 429（可重试）。
+        # 立即停止重试并提示换模型；普通瞬时限流仍用 429（可重试），并带上
+        # Retry-After，让 opencode 按我们给的时间等待（opencode 会优先遵守该头）。
         status = 429
+        retry_after = None
         if rpd_exhausted:
             try:
                 from app.config.config import settings
@@ -175,7 +200,14 @@ class AllKeysCoolingError(APIError):
                 status = settings.NETWORK_ERROR_STATUS_CODE
             except Exception:
                 status = 424
-        super().__init__(status_code=status, detail=detail, error_code="all_keys_cooling")
+        elif retry_after_s and retry_after_s > 0:
+            retry_after = retry_after_s
+        super().__init__(
+            status_code=status,
+            detail=detail,
+            error_code="all_keys_cooling",
+            retry_after=retry_after,
+        )
 
 
 def setup_exception_handlers(app: FastAPI) -> None:
@@ -190,9 +222,14 @@ def setup_exception_handlers(app: FastAPI) -> None:
     async def api_error_handler(request: Request, exc: APIError):
         """处理API错误"""
         logger.error(f"API Error: {exc.detail} (Code: {exc.error_code})")
+        headers = {}
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after and retry_after > 0:
+            headers["Retry-After"] = str(int(retry_after))
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.error_code, "message": exc.detail}},
+            headers=headers or None,
         )
 
     @app.exception_handler(StarletteHTTPException)

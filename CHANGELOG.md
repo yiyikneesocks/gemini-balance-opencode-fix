@@ -6,6 +6,21 @@ Upstream code is otherwise unchanged.
 
 ## 2026-09-27
 
+### Error messages must avoid opencode's retry regexes
+
+- Per `opencode-config/RETRY-POLICY.md` §3, opencode decides "retryable" not only by
+  status code but also by matching the error **message / responseBody** against a set
+  of regexes (`network error`, `connection error`, `timeout`, `overloaded`,
+  `at capacity`, numeric `429|500|502|503|504|524`, …). A 424 whose *text* matched
+  would still be retried.
+- Rewrote the non-retryable (424) messages so they contain **none** of those triggers:
+  - `UpstreamNetworkError` no longer echoes the raw exception text (it kept
+    `ConnectError`/`timed out`, which matched). Raw text is logged only.
+  - `UpstreamOverloadError` no longer says `503`/`overloaded`.
+  - `AllKeysCoolingError` (RPD) reworded.
+- The transient 429 path intentionally keeps retryable wording and now sends a
+  `Retry-After` header so opencode waits exactly as instructed.
+
 ### Circuit breaker for 424 (fast-fail window)
 
 - Once a 424 is returned (network unreachable / all-RPD / sustained overload), a

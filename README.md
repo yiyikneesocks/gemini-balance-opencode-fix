@@ -70,6 +70,11 @@ outage trips a **global** breaker (all models); a model whose daily quota is ful
 exhausted, or which is consistently overloaded, trips a **per-model** breaker. Any
 successful call closes the breaker immediately.
 
+> Note: opencode decides retryability from the status code **and** the error text
+> (see `opencode-config/RETRY-POLICY.md`). The 424 messages here are deliberately
+> worded to avoid opencode's retry regexes, so they are genuinely non-retryable.
+> The transient 429 responses carry a `Retry-After` header.
+
 ### 3. Load balancing by daily usage
 
 The backend's dispatch is deliberately simple and **request-agnostic**: it only
